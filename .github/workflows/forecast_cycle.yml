@@ -89,7 +89,7 @@ jobs:
           cp -a artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip
 
       - name: Retrain and package after drift
-        if: steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true'
+        if: steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
         run: |
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
             PYTHONPATH=src python examples/03_gradient_boosting.py
@@ -97,7 +97,7 @@ jobs:
             PYTHONPATH=src python examples/04_package_best_model.py
 
       - name: Promote only if WAPE improves
-        if: steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true'
+        if: steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
         run: |
           PYTHONPATH=src python scripts/promote_model.py \
             --candidate artifacts/pulso_transmi_best_models \
