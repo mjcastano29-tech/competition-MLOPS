@@ -50,6 +50,15 @@ jobs:
           restore-keys: |
             pulso-transmi-model-
 
+      - name: Check restored model package
+        id: model_state
+        run: |
+          if [[ -f artifacts/pulso_transmi_best_models/best_ensemble_summary.csv ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Detect data drift
         id: drift
         run: |
@@ -60,14 +69,14 @@ jobs:
           echo "drift_detected=$drift_detected" >> "$GITHUB_OUTPUT"
 
       - name: Save previous model for WAPE comparison
-        if: steps.model_cache.outputs.cache-hit == 'true'
+        if: steps.model_state.outputs.available == 'true'
         run: |
           rm -rf artifacts/previous_model artifacts/previous_model.zip
           cp -a artifacts/pulso_transmi_best_models artifacts/previous_model
           cp -a artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip
 
       - name: Retrain and package after drift
-        if: steps.model_cache.outputs.cache-hit != 'true' || steps.drift.outputs.drift_detected == 'true'
+        if: steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true'
         run: |
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
             PYTHONPATH=src python examples/03_gradient_boosting.py
@@ -75,7 +84,7 @@ jobs:
             PYTHONPATH=src python examples/04_package_best_model.py
 
       - name: Promote only if WAPE improves
-        if: steps.model_cache.outputs.cache-hit != 'true' || steps.drift.outputs.drift_detected == 'true'
+        if: steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true'
         run: |
           PYTHONPATH=src python scripts/promote_model.py \
             --candidate artifacts/pulso_transmi_best_models \
