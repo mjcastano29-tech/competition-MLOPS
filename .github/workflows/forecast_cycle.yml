@@ -77,6 +77,7 @@ jobs:
 
       - name: Detect data drift
         id: drift
+        if: env.DRY_RUN == 'true' || steps.model_state.outputs.available != 'true'
         run: |
           PYTHONPATH=src python scripts/detect_drift.py \
             --threshold "$DRIFT_THRESHOLD" \
@@ -85,14 +86,16 @@ jobs:
           echo "drift_detected=$drift_detected" >> "$GITHUB_OUTPUT"
 
       - name: Save previous model for WAPE comparison
-        if: steps.model_state.outputs.available == 'true'
+        if: env.DRY_RUN == 'true' && steps.model_state.outputs.available == 'true'
         run: |
           rm -rf artifacts/previous_model artifacts/previous_model.zip
           cp -a artifacts/pulso_transmi_best_models artifacts/previous_model
-          cp -a artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip
+          if [[ -f artifacts/pulso_transmi_best_models.zip ]]; then
+            cp -a artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip
+          fi
 
       - name: Retrain and package after drift
-        if: steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
+        if: (env.DRY_RUN == 'true' && steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')) || steps.model_state.outputs.available != 'true'
         run: |
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
             PYTHONPATH=src python examples/03_gradient_boosting.py
@@ -100,7 +103,7 @@ jobs:
             PYTHONPATH=src python examples/04_package_best_model.py
 
       - name: Promote only if WAPE improves
-        if: steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
+        if: env.DRY_RUN == 'true' && steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
         run: |
           PYTHONPATH=src python scripts/promote_model.py \
             --candidate artifacts/pulso_transmi_best_models \
