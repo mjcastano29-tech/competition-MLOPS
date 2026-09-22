@@ -228,8 +228,13 @@ de 15 minutos; siempre debe obedecerse la respuesta del ciclo actual.
 
 El workflow de GitHub Actions en `.github/workflows/forecast_cycle.yml` consulta el
 ciclo cada 10 minutos. En cada ejecución descarga los datos actuales desde la API,
-reentrena y empaqueta el modelo validado, y si encuentra un ciclo abierto genera y
-envía las 12 predicciones automáticamente. Requiere el secreto `PULSO_API_KEY`.
+calcula PSI sobre ventanas recientes, y solo reentrena si no existe un paquete
+cacheado o si el PSI supera `DRIFT_THRESHOLD` (por defecto `0.20`). Si encuentra
+un ciclo abierto genera y envía las 12 predicciones automáticamente. Requiere el
+secreto `PULSO_API_KEY`; `DRIFT_THRESHOLD` puede configurarse como variable del
+repositorio. Cuando hay drift, el candidato solo se promueve si su WAPE promedio
+por horizonte mejora al paquete anterior; de lo contrario se conserva el modelo
+anterior y el resultado queda en `model_promotion.json`.
 
 ## Cargar datos en Supabase
 
