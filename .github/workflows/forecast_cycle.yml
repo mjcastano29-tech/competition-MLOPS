@@ -59,6 +59,19 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Submit immediately with cached model
+        id: fast_submit
+        if: env.DRY_RUN != 'true' && steps.model_state.outputs.available == 'true'
+        run: |
+          result=$(PYTHONPATH=src python scripts/infer_and_submit.py \
+            --output artifacts/current_submission.json)
+          printf '%s\n' "$result"
+          if grep -q '"is_official": true' <<< "$result"; then
+            echo "submitted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "submitted=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Detect data drift
         id: drift
         run: |
@@ -94,6 +107,7 @@ jobs:
             --output artifacts/model_promotion.json
 
       - name: Check whether the cycle is open, generate predictions, and submit
+        if: steps.fast_submit.outputs.submitted != 'true'
         run: |
           args=(--output artifacts/current_submission.json)
           if [[ "$DRY_RUN" == "true" ]]; then
