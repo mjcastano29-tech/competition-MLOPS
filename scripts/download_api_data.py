@@ -11,8 +11,6 @@ DATA_DIR = ROOT / "data"
 
 def main() -> None:
     api_key = os.getenv("PULSO_API_KEY")
-    if not api_key:
-        raise RuntimeError("Falta PULSO_API_KEY para descargar los datos actuales.")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with PulsoTransmiClient(api_key=api_key) as client:
