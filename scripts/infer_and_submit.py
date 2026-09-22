@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pickle
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -189,6 +190,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Consulta el ciclo activo, genera predicciones y envía la submission si el ciclo está abierto.")
     parser.add_argument("--dry-run", action="store_true", help="No envía la submission; solo genera el payload local.")
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "current_submission.json")
+    parser.add_argument("--wait-seconds", type=int, default=0, help="Espera este tiempo buscando un ciclo abierto.")
+    parser.add_argument("--poll-seconds", type=int, default=30, help="Intervalo entre consultas del ciclo.")
     args = parser.parse_args()
 
     api_key = os.getenv("PULSO_API_KEY")
@@ -197,7 +200,13 @@ def main() -> int:
 
     base_url = os.getenv("PULSO_API_URL", DEFAULT_API_URL).rstrip("/")
     with httpx.Client(base_url=base_url, timeout=30.0) as client:
+        deadline = time.monotonic() + max(args.wait_seconds, 0)
         cycle = load_cycle(client, api_key)
+        while (cycle is None or cycle.get("state") != "open") and time.monotonic() < deadline:
+            remaining = int(deadline - time.monotonic())
+            print(f"No hay ciclo abierto; reintentando en {args.poll_seconds}s (quedan {remaining}s).")
+            time.sleep(min(args.poll_seconds, max(remaining, 1)))
+            cycle = load_cycle(client, api_key)
         if cycle is None or cycle.get("state") != "open":
             print("No hay un ciclo abierto; la acción termina sin enviar predicciones.")
             return 0

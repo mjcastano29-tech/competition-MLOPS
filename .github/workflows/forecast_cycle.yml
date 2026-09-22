@@ -67,7 +67,9 @@ jobs:
         if: env.DRY_RUN != 'true' && steps.model_state.outputs.available == 'true'
         run: |
           result=$(PYTHONPATH=src python scripts/infer_and_submit.py \
-            --output artifacts/current_submission.json)
+            --output artifacts/current_submission.json \
+            --wait-seconds 240 \
+            --poll-seconds 30)
           printf '%s\n' "$result"
           if grep -q '"is_official": true' <<< "$result"; then
             echo "submitted=true" >> "$GITHUB_OUTPUT"
@@ -119,6 +121,7 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
           fi
+          args+=(--wait-seconds 240 --poll-seconds 30)
           PYTHONPATH=src python scripts/infer_and_submit.py "${args[@]}"
 
       - name: Upload generated submission artifact
