@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Entrena y genera el payload sin enviarlo'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
   poll-and-submit:
@@ -13,6 +19,7 @@ jobs:
     env:
       PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,8 +47,11 @@ jobs:
 
       - name: Check whether the cycle is open, generate predictions, and submit
         run: |
-          PYTHONPATH=src python scripts/infer_and_submit.py \
-            --output artifacts/current_submission.json
+          args=(--output artifacts/current_submission.json)
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          PYTHONPATH=src python scripts/infer_and_submit.py "${args[@]}"
 
       - name: Upload generated submission artifact
         if: always()
