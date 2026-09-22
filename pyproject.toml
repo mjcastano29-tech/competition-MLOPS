@@ -15,8 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ml = ["scikit-learn>=1.5,<2"]
+ml = ["scikit-learn>=1.5,<2", "mlflow>=2.16,<4"]
 dev = ["pytest>=8,<9"]
+eda = ["matplotlib>=3.8,<4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,15 @@
+dataset,column,rows,missing,missing_pct,unique
+stations,station_id,12,0,0.0,12
+stations,station_name,12,0,0.0,12
+stations,corridor,12,0,0.0,7
+stations,latitude,12,0,0.0,12
+stations,longitude,12,0,0.0,12
+observations,observed_at,51840,0,0.0,4320
+observations,station_id,51840,0,0.0,12
+observations,demand,51840,0,0.0,1778
+context,observed_at,4320,0,0.0,4320
+context,rain_mm,4320,0,0.0,4316
+context,rain_forecast,4320,0,0.0,2752
+context,temperature_c,4320,0,0.0,4320
+context,temperature_forecast,4320,0,0.0,4320
+context,event_intensity,4320,0,0.0,876

@@ -1,0 +1,49 @@
+horizon_minutes,model,station_id,wape,accuracy
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),02300,0.1396685670425567,86.03314329574432
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),03000,0.11737366939913911,88.26263306008609
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),05000,0.12240803692207264,87.75919630779272
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),05100,0.11813180643758703,88.18681935624129
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),06000,0.12959241511483305,87.0407584885167
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),06111,0.12927313712718602,87.0726862872814
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),07105,0.13211836776691502,86.7881632233085
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),07107,0.12354398841482316,87.64560115851769
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),07111,0.11829694509575735,88.17030549042427
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),09000,0.1284582985842945,87.15417014157055
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),09122,0.12278515894869398,87.72148410513061
+15,Ensemble HGB more regularized + Seasonal Naive 7d (1.0),10009,0.14048246167880057,85.95175383211995
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),02300,0.14268429220859477,85.73157077914051
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),03000,0.11765896250676033,88.23410374932398
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),05000,0.12398665838089419,87.60133416191059
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),05100,0.11901862671151035,88.09813732884896
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),06000,0.13117238597237632,86.88276140276237
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),06111,0.13464632675247656,86.53536732475236
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),07105,0.13717367290536508,86.28263270946348
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),07107,0.12664192081571676,87.33580791842832
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),07111,0.11910141891853415,88.08985810814659
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),09000,0.13190761749476018,86.80923825052399
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),09122,0.126141366536647,87.38586334633528
+30,Ensemble HGB baseline + Seasonal Naive 7d (1.0),10009,0.14319467800198968,85.68053219980102
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),02300,0.1457067098159221,85.42932901840778
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),03000,0.12136756549104098,87.8632434508959
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),05000,0.12759701139330692,87.24029886066931
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),05100,0.11996075203045169,88.00392479695483
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),06000,0.13225391093500174,86.77460890649984
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),06111,0.13866422886178778,86.13357711382122
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),07105,0.14177016438141676,85.82298356185834
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),07107,0.13198529332808964,86.80147066719104
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),07111,0.12195407804054686,87.80459219594532
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),09000,0.1323866340335858,86.76133659664141
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),09122,0.12944281732587604,87.05571826741239
+45,Ensemble HGB baseline + Seasonal Naive 7d (1.0),10009,0.14843615526316054,85.15638447368394
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),02300,0.14963520565194638,85.03647943480536
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),03000,0.12451263129722534,87.54873687027747
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),05000,0.13199250306874197,86.8007496931258
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),05100,0.12366731343380911,87.63326865661908
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),06000,0.13600572953453638,86.39942704654636
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),06111,0.14290540463484572,85.70945953651544
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),07105,0.14152302036252443,85.84769796374756
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),07107,0.13790223807481025,86.20977619251897
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),07111,0.12470239199432724,87.52976080056727
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),09000,0.1388218679590977,86.11781320409023
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),09122,0.13644678902845728,86.35532109715427
+60,Ensemble HGB strong regularization + Seasonal Naive 7d (1.0),10009,0.15288710374634445,84.71128962536555

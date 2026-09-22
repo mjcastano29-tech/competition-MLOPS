@@ -1,0 +1,7 @@
+,demand,rain_mm,rain_forecast,temperature_c,temperature_forecast,event_intensity
+demand,1.0,-0.01,-0.008,0.208,0.205,0.088
+rain_mm,-0.01,1.0,0.823,0.036,0.037,-0.021
+rain_forecast,-0.008,0.823,1.0,0.031,0.034,-0.014
+temperature_c,0.208,0.036,0.031,1.0,0.982,0.014
+temperature_forecast,0.205,0.037,0.034,0.982,1.0,0.018
+event_intensity,0.088,-0.021,-0.014,0.014,0.018,1.0

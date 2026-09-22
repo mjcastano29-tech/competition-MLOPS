@@ -1,0 +1,52 @@
+name: forecast-cycle-poller
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  poll-and-submit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
+      PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[ml]'
+
+      - name: Download current API data
+        run: PYTHONPATH=src python scripts/download_api_data.py
+
+      - name: Train and package the validated model
+        run: |
+          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
+            PYTHONPATH=src python examples/03_gradient_boosting.py
+          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
+            PYTHONPATH=src python examples/04_package_best_model.py
+
+      - name: Check whether the cycle is open, generate predictions, and submit
+        run: |
+          PYTHONPATH=src python scripts/infer_and_submit.py \
+            --output artifacts/current_submission.json
+
+      - name: Upload generated submission artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-submission
+          path: artifacts/current_submission.json
+          if-no-files-found: ignore

@@ -1,0 +1,6 @@
+,correlation,abs_correlation
+temperature_c,0.208,0.208
+temperature_forecast,0.205,0.205
+event_intensity,0.088,0.088
+rain_mm,-0.01,0.01
+rain_forecast,-0.008,0.008

@@ -7,5 +7,7 @@ __pycache__/
 dist/
 build/
 artifacts/
+mlruns/
+mlflow.db
 data/
 *.egg-info/

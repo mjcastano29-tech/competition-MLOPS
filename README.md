@@ -17,7 +17,6 @@ patrones durante la competencia. Un modelo entrenado una sola vez puede perder
 desempeño: el objetivo es operar un pipeline capaz de medir, decidir y
 reentrenar.
 
-La demanda, clima y eventos son sintéticos. Los nombres y coordenadas de las
 estaciones provienen de datos oficiales de TransMilenio.
 
 ## Inicio rápido
@@ -146,6 +145,106 @@ de submissions y leaderboard se publicará antes de iniciar la ventana competiti
 python -m pip install -e '.[dev,ml]'
 pytest -q
 ```
+
+## EDA inicial
+
+Después de descargar los datos, instala la dependencia de gráficos y ejecuta:
+
+```bash
+python -m pip install -e '.[eda]'
+python eda/01_eda_inicial.py
+```
+
+El script escribe en `eda_outputs/` un resumen de calidad por columna, un
+resumen estadístico por estación, las correlaciones ordenadas con `demand` y
+gráficos sobre composición, ubicación geográfica, evolución temporal,
+distribución, perfil horario y promedios por hora y día de la semana.
+
+## Primer experimento de machine learning
+
+Para comparar los baselines estacionales con un modelo global de gradient
+boosting, ejecuta:
+
+```bash
+python examples/03_gradient_boosting.py
+```
+
+El experimento usa backtesting rolling sobre tres folds semanales, retardos de
+demanda, ventanas históricas, calendario, estación, clima pronosticado y
+eventos. Evalúa modelos directos para 15, 30, 45 y 60 minutos; las variables
+meteorológicas observadas no se usan porque no estarían disponibles al predecir
+el futuro. Guarda el detalle por horizonte, modelo, fold y estación en
+`reports/ml_validation_metrics.csv`.
+
+El script también compara seis configuraciones de `HistGradientBoosting` y pesos
+del ensemble con el baseline semanal. En el corte actual, el mejor peso es
+`1.0`, por lo que el baseline semanal no aporta mejora; se conserva la búsqueda
+para comprobarlo en cada nuevo corte. El WAPE promedio obtenido es `12.68%` a
+15 minutos, `12.94%` a 30, `13.26%` a 45 y `13.68%` a 60.
+
+Todas las evaluaciones se registran en MLflow: parámetros, WAPE por estación,
+accuracy promedio, fold, horizonte, cobertura de las 12 estaciones, reporte CSV
+y modelo serializado. MLflow usa por defecto `mlflow.db` y `mlruns/` localmente.
+Para abrir la interfaz:
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+Después visita `http://127.0.0.1:5000`. Las corridas se agrupan en el experimento
+`pulso-transmi-forecasting`. `mlruns/` y `mlflow.db` son artefactos locales y no
+deben subirse al repositorio.
+
+Para empaquetar los mejores modelos validados, ejecuta:
+
+```bash
+PYTHONPATH=src python examples/04_package_best_model.py
+```
+
+El paquete se genera en `artifacts/pulso_transmi_best_models.zip` e incluye un
+modelo por horizonte, la configuración del ensemble, el WAPE de las 12
+estaciones y un manifiesto SHA-256.
+
+## Enviar una predicción al API
+
+El contrato vigente de submissions está disponible en `/docs` y en
+`/openapi.json`. El ciclo activo se consulta en
+`/v1/forecast-cycles/current`; sus targets definen exactamente las estaciones y
+fechas que deben enviarse.
+
+```bash
+export PULSO_API_KEY='TU_API_KEY'
+PYTHONPATH=src python scripts/submit_prediction.py \
+	--template /tmp/submission.json
+# Completa predictions[].value con las predicciones del modelo
+PYTHONPATH=src python scripts/submit_prediction.py \
+	--payload /tmp/submission.json
+```
+
+El script valida `cycle_id`, `data_cutoff`, cobertura de estaciones, cantidad de
+predicciones y rangos antes de enviar a `POST /v1/submissions`. Usa una clave de
+idempotencia automáticamente. La API puede pedir 12 predicciones para un ciclo
+de 15 minutos; siempre debe obedecerse la respuesta del ciclo actual.
+
+El workflow de GitHub Actions en `.github/workflows/forecast_cycle.yml` consulta el
+ciclo cada 10 minutos. En cada ejecución descarga los datos actuales desde la API,
+reentrena y empaqueta el modelo validado, y si encuentra un ciclo abierto genera y
+envía las 12 predicciones automáticamente. Requiere el secreto `PULSO_API_KEY`.
+
+## Cargar datos en Supabase
+
+La migración crea las tablas en `supabase/migrations/`. Para cargar el corte
+actual de la API en `datasets`, `stations`, `context` y `observations`, usa una
+`service_role key` únicamente como variable local y ejecuta:
+
+```bash
+export SUPABASE_URL=https://TU_PROJECT_REF.supabase.co
+export SUPABASE_SERVICE_ROLE_KEY='TU_SERVICE_ROLE_KEY'
+PYTHONPATH=src python scripts/ingest_api_to_supabase.py
+```
+
+El script usa `upsert` por lotes y puede repetirse sin duplicar datos. Nunca
+subas la `service_role key` al repositorio ni la uses en el navegador.
 
 Este repositorio es público para estudiantes. No debe contener ground truth
 futuro, semillas, configuración privada del escenario ni parámetros de drift.
