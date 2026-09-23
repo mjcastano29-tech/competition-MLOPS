@@ -2,7 +2,8 @@ name: forecast-cycle-poller
 
 on:
   schedule:
-    - cron: '2-59/5 * * * *'
+    - cron: '1-59/5 * * * *'
+    - cron: '3-59/5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -73,7 +74,7 @@ jobs:
         run: |
           PYTHONPATH=src python scripts/infer_and_submit.py \
             --output artifacts/current_submission.json \
-            --wait-seconds 240 \
+            --wait-seconds 90 \
             --poll-seconds 30
 
       - name: Detect data drift
@@ -130,7 +131,7 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
           fi
-          args+=(--wait-seconds 240 --poll-seconds 30)
+          args+=(--wait-seconds 90 --poll-seconds 30)
           PYTHONPATH=src python scripts/infer_and_submit.py "${args[@]}"
 
       - name: Report delivery outcome
