@@ -185,13 +185,33 @@ def _feature_row_for_target(
     return row
 
 
+def normalize_station_id(value: Any) -> str:
+    station_id = str(value).strip()
+    return station_id.zfill(5) if station_id.isdigit() else station_id
+
+
 def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
-    observations = pd.read_csv(SAMPLE_DATA_PATHS["observations"], parse_dates=["observed_at"])
+    observations = pd.read_csv(
+        SAMPLE_DATA_PATHS["observations"],
+        dtype={"station_id": "string"},
+        parse_dates=["observed_at"],
+    )
     context = pd.read_csv(SAMPLE_DATA_PATHS["context"], parse_dates=["observed_at"])
-    observations["station_id"] = observations["station_id"].astype(str)
+    observations["station_id"] = observations["station_id"].map(normalize_station_id)
 
     targets = cycle["targets"]
     data_cutoff = pd.to_datetime(cycle["data_cutoff"])
+    target_stations = {normalize_station_id(target["station_id"]) for target in targets}
+    available_stations = set(
+        observations.loc[observations["observed_at"] <= data_cutoff, "station_id"].dropna()
+    )
+    missing_stations = sorted(target_stations - available_stations)
+    if missing_stations:
+        raise RuntimeError(
+            "No hay historial de observaciones hasta el data_cutoff para estas estaciones: "
+            + ", ".join(missing_stations)
+        )
+    print(f"Historial disponible para {len(target_stations)} estaciones objetivo.")
     latest_observation = observations.loc[
         observations["observed_at"] <= data_cutoff, "observed_at"
     ].max()
@@ -204,7 +224,7 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
         with model_path.open("rb") as stream:
             loaded_models[horizon] = pickle.load(stream)
     for target in targets:
-        station_id = str(target["station_id"])
+        station_id = normalize_station_id(target["station_id"])
         target_at = pd.to_datetime(target["target_at"])
         horizon_minutes = int((target_at - data_cutoff).total_seconds() // 60)
         if horizon_minutes not in bundle:
