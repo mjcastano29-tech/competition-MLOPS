@@ -7,8 +7,23 @@ create table if not exists public.forecast_predictions (
     data_cutoff timestamptz not null,
     horizon_minutes integer not null check (horizon_minutes > 0),
     predicted_demand numeric not null check (predicted_demand >= 0),
+    payload_hash text,
+    model_version text,
+    git_commit text,
+    training_data_end timestamptz,
     created_at timestamptz not null default now(),
     primary key (cycle_id, station_id, target_at)
+);
+
+alter table public.forecast_predictions add column if not exists payload_hash text;
+alter table public.forecast_predictions add column if not exists model_version text;
+alter table public.forecast_predictions add column if not exists git_commit text;
+alter table public.forecast_predictions add column if not exists training_data_end timestamptz;
+
+create table if not exists public.api_cursors (
+    stream_name text primary key,
+    cursor_value timestamptz not null,
+    updated_at timestamptz not null default now()
 );
 
 create index if not exists forecast_predictions_target_idx
@@ -37,3 +52,4 @@ create index if not exists wape_drift_pending_idx
 
 alter table public.forecast_predictions enable row level security;
 alter table public.wape_drift_checks enable row level security;
+alter table public.api_cursors enable row level security;

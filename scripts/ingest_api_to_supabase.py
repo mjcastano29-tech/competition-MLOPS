@@ -12,6 +12,7 @@ from pulso_transmi import PulsoTransmiClient
 
 
 BATCH_SIZE = 500
+STREAM_PAGE_SIZE = 5000
 DEFAULT_SUPABASE_URL = "https://jwlgxabibcticikhjhzf.supabase.co"
 
 
@@ -81,6 +82,38 @@ class SupabaseRestClient:
         if not rows:
             raise SupabaseIngestionError("Supabase no devolvió el dataset creado.")
         return rows[0]
+
+    def has_observations(self) -> bool:
+        response = self._client.get("/observations", params={"select": "observation_id", "limit": "1"})
+        if response.is_error:
+            raise SupabaseIngestionError(
+                f"No se pudo comprobar la carga inicial: HTTP {response.status_code} {response.text}"
+            )
+        return bool(response.json())
+
+    def get_watermark(self, stream_name: str) -> datetime | None:
+        response = self._client.get(
+            "/api_cursors",
+            params={"select": "cursor_value", "stream_name": f"eq.{stream_name}", "limit": "1"},
+        )
+        if response.is_error:
+            raise SupabaseIngestionError(
+                f"No se pudo leer api_cursors: HTTP {response.status_code} {response.text}"
+            )
+        rows = response.json()
+        return datetime.fromisoformat(rows[0]["cursor_value"].replace("Z", "+00:00")) if rows else None
+
+    def save_watermark(self, stream_name: str, value: datetime) -> None:
+        response = self._client.post(
+            "/api_cursors",
+            params={"on_conflict": "stream_name"},
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            json={"stream_name": stream_name, "cursor_value": value.isoformat()},
+        )
+        if response.is_error:
+            raise SupabaseIngestionError(
+                f"No se pudo avanzar el cursor {stream_name}: HTTP {response.status_code} {response.text}"
+            )
 
 
 def isoformat(value: Any) -> str:
@@ -163,25 +196,61 @@ def main() -> None:
             ]
             upsert_in_batches(supabase, "context", context_rows, "observed_at")
 
-            observations_frame = api.observations_dataframe()
-            observation_rows = [
-                {
-                    "dataset_id": dataset_id,
-                    "station_id": row["station_id"],
-                    "observed_at": isoformat(row["observed_at"]),
-                    "demand": int(row["demand"]),
-                }
-                for row in observations_frame.to_dict("records")
-            ]
-            upsert_in_batches(
-                supabase,
-                "observations",
-                observation_rows,
-                "station_id,observed_at",
-            )
+            observation_count = 0
+            if not supabase.has_observations():
+                # Bootstrap the complete history once; subsequent runs consume
+                # released stream rows and advance the watermark only after writes.
+                observations_frame = api.observations_dataframe()
+                observation_rows = [
+                    {
+                        "dataset_id": dataset_id,
+                        "station_id": str(row["station_id"]),
+                        "observed_at": isoformat(row["observed_at"]),
+                        "demand": int(row["demand"]),
+                    }
+                    for row in observations_frame.to_dict("records")
+                ]
+                upsert_in_batches(supabase, "observations", observation_rows, "station_id,observed_at")
+                observation_count += len(observation_rows)
+
+            watermark = supabase.get_watermark("observations")
+            cursor = None
+            seen_cursors: set[str] = set()
+            latest_release = watermark
+            while True:
+                page = api.stream_observations_page(cursor=cursor, limit=STREAM_PAGE_SIZE)
+                stream_rows = []
+                for row in page.get("data", []):
+                    released_at = datetime.fromisoformat(row["released_at"].replace("Z", "+00:00"))
+                    if latest_release is None or released_at > latest_release:
+                        latest_release = released_at
+                    # Re-read equal-time rows so a partial failure cannot skip
+                    # records sharing a release timestamp. Upserts are idempotent.
+                    if watermark is not None and released_at < watermark:
+                        continue
+                    stream_rows.append({
+                        "dataset_id": dataset_id,
+                        "station_id": str(row["station_id"]),
+                        "observed_at": isoformat(row["observed_at"]),
+                        "demand": int(row["demand"]),
+                    })
+                upsert_in_batches(supabase, "observations", stream_rows, "station_id,observed_at")
+                observation_count += len(stream_rows)
+                next_cursor = page.get("next_cursor")
+                if next_cursor is None:
+                    break
+                if next_cursor in seen_cursors:
+                    raise SupabaseIngestionError("La API devolvió un cursor repetido en el stream.")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+
+            if latest_release is not None and latest_release != watermark:
+                # Move the timestamp cursor only after all page writes succeed.
+                supabase.save_watermark("observations", latest_release)
             print(
                 f"Carga completa: {len(station_rows)} estaciones, "
-                f"{len(context_rows)} contextos, {len(observation_rows)} observaciones."
+                f"{len(context_rows)} contextos, {observation_count} observaciones procesadas; "
+                f"watermark={latest_release.isoformat() if latest_release else 'sin cambios'}."
             )
     finally:
         supabase.close()

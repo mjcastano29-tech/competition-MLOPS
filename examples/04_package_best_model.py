@@ -138,8 +138,11 @@ def main() -> None:
             model_files.extend([model_path, config_path])
 
         files = [*model_files, PACKAGE_DIR / "wape_by_station.csv", PACKAGE_DIR / "best_ensemble_summary.csv"]
+        observations = pd.read_csv(ROOT / "data/observations.csv", parse_dates=["observed_at"])
+        training_data_end = pd.to_datetime(observations["observed_at"], utc=True).max().isoformat()
         manifest = {
             "experiment": EXPERIMENT,
+            "training_data_end": training_data_end,
             "mlflow_run_id": run.info.run_id,
             "metric": "WAPE per station, mean across 12 stations",
             "horizons_minutes": sorted(int(value) for value in best_names),

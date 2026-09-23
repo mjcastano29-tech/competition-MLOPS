@@ -99,6 +99,15 @@ class PulsoTransmiClient:
         params = {"start": start, "end": end, "cursor": cursor, "limit": limit}
         return self._get("/v1/context", params={key: value for key, value in params.items() if value is not None}).json()
 
+    def stream_observations_page(
+        self, *, cursor: str | None = None, limit: int = 5000
+    ) -> dict[str, Any]:
+        params = {"cursor": cursor, "limit": limit}
+        return self._get(
+            "/v1/stream/observations",
+            params={key: value for key, value in params.items() if value is not None},
+        ).json()
+
     def _all_pages(self, endpoint: str, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
         cursor = None
         seen: set[str] = set()

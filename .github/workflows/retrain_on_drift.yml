@@ -54,9 +54,9 @@ jobs:
             [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || available=false
           done
           echo "available=$available" >> "$GITHUB_OUTPUT"
-      - name: Download current API data
+      - name: Download current collected data from Supabase
         if: steps.pending.outputs.drift_pending == 'true' || steps.model_state.outputs.available != 'true'
-        run: PYTHONPATH=src python scripts/download_api_data.py
+        run: python scripts/download_supabase_data.py
       - name: Preserve prior package
         if: steps.pending.outputs.drift_pending == 'true' && steps.model_state.outputs.available == 'true'
         run: |

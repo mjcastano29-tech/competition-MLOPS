@@ -74,6 +74,7 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
     reference_start = current_start - timedelta(days=args.window_days)
     predictions = supabase.rows("forecast_predictions", {
         "select": "cycle_id,station_id,target_at,predicted_demand",
+        "submission_id": "not.is.null",
         "target_at": f"gte.{reference_start.isoformat()}",
         "order": "target_at.asc",
     })

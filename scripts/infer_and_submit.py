@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import pickle
+import subprocess
+import sys
 import time
-import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -250,16 +252,59 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
     return predictions
 
 
-def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]]) -> dict[str, Any]:
+def model_metadata(bundle: dict[int, tuple[Path, dict[str, Any]]]) -> dict[str, str | None]:
+    digest = hashlib.sha256()
+    seen: set[Path] = set()
+    for model_path, config in bundle.values():
+        for path in (model_path, model_path.parent.parent / "configs" / f"horizon_{int(model_path.name.split('horizon_')[1].split('_hgb')[0])}_ensemble.json"):
+            if path in seen or not path.exists():
+                continue
+            seen.add(path)
+            digest.update(path.name.encode("utf-8"))
+            digest.update(path.read_bytes())
+    model_version = f"pulso-hgb-{digest.hexdigest()[:16]}"
+    manifest_path = next(iter(bundle.values()))[0].parent.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    training_end = manifest.get("training_data_end")
+    if not training_end and SAMPLE_DATA_PATHS["observations"].exists():
+        frame = pd.read_csv(SAMPLE_DATA_PATHS["observations"], usecols=["observed_at"], parse_dates=["observed_at"])
+        latest = pd.to_datetime(frame["observed_at"], utc=True).max()
+        training_end = latest.isoformat() if pd.notna(latest) else None
+    return {"version": model_version, "training_data_end": training_end}
+
+
+def payload_hash(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def find_confirmed_submission(cycle_id: str) -> dict[str, Any] | None:
+    supabase_url = os.getenv("SUPABASE_URL", "https://jwlgxabibcticikhjhzf.supabase.co").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not service_key:
+        raise RuntimeError("Falta SUPABASE_SERVICE_ROLE_KEY; no se enviará sin poder registrar el recibo y evitar duplicados.")
+    response = httpx.get(
+        f"{supabase_url}/rest/v1/forecast_predictions",
+        params={"select": "submission_id,model_version,payload_hash", "cycle_id": f"eq.{cycle_id}", "submission_id": "not.is.null", "limit": "1"},
+        headers=supabase_request_headers(service_key),
+        timeout=30.0,
+    )
+    if response.is_error:
+        raise RuntimeError(f"No se pudo comprobar el recibo en Supabase: HTTP {response.status_code} {response.text}")
+    rows = response.json()
+    return rows[0] if rows else None
+
+def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]], metadata: dict[str, str | None] | None = None) -> dict[str, Any]:
+    cycle_fingerprint = hashlib.sha256(str(cycle["cycle_id"]).encode("utf-8")).hexdigest()[:32]
     payload = {
         "schema_version": "1.0",
         "cycle_id": cycle["cycle_id"],
-        "client_run_id": f"gha-{uuid.uuid4().hex}",
+        "client_run_id": f"gha-cycle-{cycle_fingerprint}",
         "data_cutoff": cycle["data_cutoff"],
         "model": {
-            "version": "pulso-transmi-history-gap-aware-hgb",
-            "training_data_end": None,
-            "git_commit": None,
+            "version": (metadata or {}).get("version", "pulso-transmi-history-gap-aware-hgb"),
+            "training_data_end": (metadata or {}).get("training_data_end"),
+            "git_commit": os.getenv("GITHUB_SHA", "unknown"),
         },
         "predictions": predictions,
     }
@@ -268,8 +313,14 @@ def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]]) -> d
 
 def validate_predictions(cycle: dict[str, Any], predictions: list[dict[str, Any]]) -> None:
     expected = cycle.get("targets", [])
-    expected_keys = {(str(target["station_id"]), target["target_at"]) for target in expected}
-    received_keys = [(str(item["station_id"]), item["target_at"]) for item in predictions]
+    expected_keys = {
+        (normalize_station_id(target["station_id"]), pd.to_datetime(target["target_at"], utc=True).isoformat())
+        for target in expected
+    }
+    received_keys = [
+        (normalize_station_id(item["station_id"]), pd.to_datetime(item["target_at"], utc=True).isoformat())
+        for item in predictions
+    ]
     expected_count = cycle.get("expected_predictions", len(expected))
     if len(predictions) != expected_count or len(set(received_keys)) != len(received_keys):
         raise ValueError(
@@ -285,7 +336,7 @@ def validate_predictions(cycle: dict[str, Any], predictions: list[dict[str, Any]
 
 
 def submit_with_retries(
-    client: httpx.Client, api_key: str, payload: dict[str, Any], attempts: int = 5
+    client: httpx.Client, api_key: str, payload: dict[str, Any], attempts: int = 3
 ) -> httpx.Response:
     retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
     headers = request_headers(api_key, payload["client_run_id"])
@@ -337,6 +388,7 @@ def persist_confirmed_predictions(payload: dict[str, Any], submission_id: str | 
         write_github_output("monitoring_persisted", "false")
         return False
     cutoff = pd.to_datetime(payload["data_cutoff"], utc=True)
+    digest = payload_hash(payload)
     rows = []
     for prediction in payload["predictions"]:
         target_at = pd.to_datetime(prediction["target_at"], utc=True)
@@ -349,6 +401,10 @@ def persist_confirmed_predictions(payload: dict[str, Any], submission_id: str | 
             "data_cutoff": cutoff.isoformat(),
             "horizon_minutes": int((target_at - cutoff).total_seconds() // 60),
             "predicted_demand": prediction["value"],
+            "payload_hash": digest,
+            "model_version": payload["model"]["version"],
+            "git_commit": payload["model"]["git_commit"],
+            "training_data_end": payload["model"]["training_data_end"],
         })
     response = httpx.post(
         f"{supabase_url}/rest/v1/forecast_predictions",
@@ -392,10 +448,27 @@ def main() -> int:
             write_github_output("submitted", "false")
             return 0
 
+        if not args.dry_run:
+            receipt = find_confirmed_submission(str(cycle["cycle_id"]))
+            if receipt:
+                print(f"El ciclo ya tiene recibo oficial {receipt.get('submission_id')}; se omite el POST duplicado.")
+                write_github_output("submitted", "true")
+                write_github_output("already_submitted", "true")
+                write_github_output("submission_id", str(receipt.get("submission_id", "")))
+                write_github_output("monitoring_persisted", "true")
+                return 0
+
+        cutoff = pd.to_datetime(cycle["data_cutoff"], utc=True)
+        start_at = (cutoff - pd.Timedelta(days=30)).isoformat()
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "download_supabase_data.py"), "--start-at", start_at],
+            check=True,
+            cwd=ROOT,
+        )
         bundle = ensure_bundle_ready()
         predictions = infer_predictions(cycle, bundle)
         validate_predictions(cycle, predictions)
-        payload = build_payload(cycle, predictions)
+        payload = build_payload(cycle, predictions, model_metadata(bundle))
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Payload generado en {args.output} con {len(predictions)} predicciones.")
@@ -414,7 +487,8 @@ def main() -> int:
         if is_official:
             submission_id = str(result.get("submission_id", "")) or None
             write_github_output("submission_id", submission_id or "")
-            persist_confirmed_predictions(payload, submission_id)
+            if not persist_confirmed_predictions(payload, submission_id):
+                raise RuntimeError("La submission fue oficial, pero falló el registro del recibo; el siguiente intento reutilizará la misma Idempotency-Key.")
         if not is_official:
             raise RuntimeError("La API respondió sin confirmar is_official=true; revisar la respuesta antes de darlo por entregado.")
         return 0
