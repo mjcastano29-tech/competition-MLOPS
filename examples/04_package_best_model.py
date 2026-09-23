@@ -41,7 +41,7 @@ def sha256(path: Path) -> str:
 
 def main() -> None:
     module = load_training_module()
-    metrics = pd.read_csv(REPORT_PATH)
+    metrics = pd.read_csv(REPORT_PATH, dtype={"station_id": "string"})
     ensemble_metrics = metrics[metrics["model"].str.startswith("Ensemble ")].copy()
     if ensemble_metrics.empty:
         raise RuntimeError("No hay métricas de ensemble disponibles.")
@@ -53,6 +53,7 @@ def main() -> None:
         .groupby("horizon_minutes", as_index=False)
         .first()
     )
+    best_summary["history_gap_steps"] = module.TRAINING_HISTORY_GAP_STEPS
     best_names = dict(zip(best_summary["horizon_minutes"], best_summary["model"]))
     selected_metrics = ensemble_metrics.merge(
         best_summary[["horizon_minutes", "model"]],
@@ -98,12 +99,17 @@ def main() -> None:
             horizon_frame = frame.copy()
             horizon_frame["target"] = horizon_frame.groupby("station_id", sort=False)[module.TARGET].shift(-horizon)
             horizon_frame = horizon_frame.dropna(subset=["target"])
+            horizon_feature_columns = module.feature_columns_for_horizon(feature_columns, int(horizon_minutes))
             model = HistGradientBoostingRegressor(
                 **module.MODEL_CONFIGS[model_name],
                 early_stopping=False,
                 random_state=42,
             )
-            model.fit(horizon_frame[feature_columns], horizon_frame["target"])
+            model.fit(
+                horizon_frame[horizon_feature_columns],
+                horizon_frame["target"],
+                sample_weight=module.station_balanced_weights(horizon_frame),
+            )
 
             model_path = PACKAGE_DIR / "models" / f"horizon_{horizon_minutes}_hgb.pkl"
             with model_path.open("wb") as output:
@@ -114,9 +120,10 @@ def main() -> None:
                 "hgb_weight": hgb_weight,
                 "baseline": "Seasonal Naive 7d",
                 "baseline_lag": 672 - horizon,
-                "feature_columns": feature_columns,
+                "feature_columns": horizon_feature_columns,
                 "training_rows": len(horizon_frame),
                 "station_count": 12,
+                "history_gap_steps": module.TRAINING_HISTORY_GAP_STEPS,
                 "mlflow_run_id": run.info.run_id,
             }
             config_path = PACKAGE_DIR / "configs" / f"horizon_{horizon_minutes}_ensemble.json"

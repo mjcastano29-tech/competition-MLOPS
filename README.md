@@ -176,11 +176,14 @@ meteorológicas observadas no se usan porque no estarían disponibles al predeci
 el futuro. Guarda el detalle por horizonte, modelo, fold y estación en
 `reports/ml_validation_metrics.csv`.
 
-El script también compara seis configuraciones de `HistGradientBoosting` y pesos
-del ensemble con el baseline semanal. En el corte actual, el mejor peso es
-`1.0`, por lo que el baseline semanal no aporta mejora; se conserva la búsqueda
-para comprobarlo en cada nuevo corte. El WAPE promedio obtenido es `12.68%` a
-15 minutos, `12.94%` a 30, `13.26%` a 45 y `13.68%` a 60.
+La validación simula además el desfase entre la última observación disponible y
+el `data_cutoff` del ciclo (actualmente 133 intervalos de 15 minutos). Así, las
+features de demanda no consultan datos que aún no existirían al inferir. El
+paquete selecciona modelos y pesos por horizonte frente al baseline semanal. En
+la validación con ese desfase, el WAPE fue aproximadamente `13.89%`, `13.76%`,
+`13.96%` y `14.11%` para 15, 30, 45 y 60 minutos, respectivamente. Son métricas
+offline de validación temporal; el puntaje de competencia solo se confirma con
+una submission aceptada y evaluada por la plataforma.
 
 Todas las evaluaciones se registran en MLflow: parámetros, WAPE por estación,
 accuracy promedio, fold, horizonte, cobertura de las 12 estaciones, reporte CSV
@@ -230,11 +233,13 @@ El workflow de GitHub Actions en `.github/workflows/forecast_cycle.yml` consulta
 ciclo cada 10 minutos. En cada ejecución descarga los datos actuales desde la API,
 calcula PSI sobre ventanas recientes, y solo reentrena si no existe un paquete
 cacheado o si el PSI supera `DRIFT_THRESHOLD` (por defecto `0.20`). Si encuentra
-un ciclo abierto genera y envía las 12 predicciones automáticamente. Requiere el
-secreto `PULSO_API_KEY`; `DRIFT_THRESHOLD` puede configurarse como variable del
-repositorio. Cuando hay drift, el candidato solo se promueve si su WAPE promedio
-por horizonte mejora al paquete anterior; de lo contrario se conserva el modelo
-anterior y el resultado queda en `model_promotion.json`.
+un ciclo abierto genera las predicciones requeridas por los targets del ciclo y
+las envía automáticamente. Requiere el secreto `PULSO_API_KEY`;
+`DRIFT_THRESHOLD` puede configurarse como variable del repositorio. El cache se
+versiona por protocolo de desfase para evitar reutilizar un modelo entrenado con
+un supuesto de disponibilidad distinto. Cuando el protocolo es el mismo, el
+candidato solo se promueve si su WAPE promedio por horizonte mejora; si cambia,
+se registra como nuevo protocolo y `model_promotion.json` documenta la decisión.
 
 ## Cargar datos en Supabase
 

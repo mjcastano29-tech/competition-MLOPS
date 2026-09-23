@@ -50,9 +50,9 @@ jobs:
           path: |
             artifacts/pulso_transmi_best_models
             artifacts/pulso_transmi_best_models.zip
-          key: pulso-transmi-model-${{ github.run_id }}
+          key: pulso-transmi-model-gap133-${{ github.run_id }}
           restore-keys: |
-            pulso-transmi-model-
+            pulso-transmi-model-gap133-
 
       - name: Check restored model package
         id: model_state

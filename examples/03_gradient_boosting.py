@@ -13,9 +13,13 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 
 
 TARGET = "demand"
-LAGS = (1, 4, 92, 93, 94, 95, 96, 668, 669, 670, 671, 672)
+LAGS = (1, 2, 3, 4, 8, 12, 92, 93, 94, 95, 96, 668, 669, 670, 671, 672)
 ROLLING_WINDOWS = (4, 16, 96)
+ROLLING_STD_WINDOWS = (4, 16)
 HORIZONS = (1, 2, 3, 4)
+# The official cycle cutoff is currently 133 fifteen-minute periods newer
+# than the latest public observation; train against that same information lag.
+TRAINING_HISTORY_GAP_STEPS = 133
 ENSEMBLE_WEIGHTS = (0.85, 0.9, 0.95, 1.0)
 EXPECTED_STATION_COUNT = 12
 MLFLOW_EXPERIMENT = "pulso-transmi-forecasting"
@@ -63,21 +67,61 @@ MODEL_CONFIGS = {
         "min_samples_leaf": 40,
         "l2_regularization": 10.0,
     },
+    "HGB absolute error": {
+        "loss": "absolute_error",
+        "learning_rate": 0.04,
+        "max_iter": 450,
+        "max_leaf_nodes": 31,
+        "min_samples_leaf": 30,
+        "l2_regularization": 2.0,
+    },
 }
 
 
-def add_features(observations: pd.DataFrame, context: pd.DataFrame) -> pd.DataFrame:
-    frame = observations.merge(context, on="observed_at", how="left", validate="many_to_one")
+def add_features(
+    observations: pd.DataFrame,
+    context: pd.DataFrame,
+    history_gap_steps: int = TRAINING_HISTORY_GAP_STEPS,
+) -> pd.DataFrame:
+    if history_gap_steps < 0:
+        raise ValueError("history_gap_steps no puede ser negativo.")
+    frame = observations.copy()
+    frame["feature_available_at"] = frame["observed_at"] - pd.Timedelta(
+        minutes=history_gap_steps * 15
+    )
+    available_context = context.rename(columns={"observed_at": "feature_available_at"})
+    frame = frame.merge(
+        available_context,
+        on="feature_available_at",
+        how="left",
+        validate="many_to_one",
+    )
     frame = frame.sort_values(["station_id", "observed_at"]).copy()
     grouped_demand = frame.groupby("station_id", sort=False)[TARGET]
 
     for lag in LAGS:
-        frame[f"demand_lag_{lag}"] = grouped_demand.shift(lag)
+        frame[f"demand_lag_{lag}"] = grouped_demand.shift(max(lag, history_gap_steps))
 
     for window in ROLLING_WINDOWS:
         frame[f"demand_mean_{window}"] = grouped_demand.transform(
-            lambda values: values.shift(1).rolling(window).mean()
+            lambda values: values.shift(max(1, history_gap_steps)).rolling(window).mean()
         )
+
+    for window in ROLLING_STD_WINDOWS:
+        frame[f"demand_std_{window}"] = grouped_demand.transform(
+            lambda values: values.shift(max(1, history_gap_steps)).rolling(window).std()
+        )
+
+    for horizon in HORIZONS:
+        target_minutes = horizon * 15
+        target_at = frame["observed_at"] + pd.Timedelta(minutes=target_minutes)
+        quarter = target_at.dt.hour * 4 + target_at.dt.minute // 15
+        weekday = target_at.dt.dayofweek
+        frame[f"target_is_weekend_{target_minutes}"] = (weekday >= 5).astype(int)
+        frame[f"target_quarter_sin_{target_minutes}"] = np.sin(2 * np.pi * quarter / 96)
+        frame[f"target_quarter_cos_{target_minutes}"] = np.cos(2 * np.pi * quarter / 96)
+        frame[f"target_weekday_sin_{target_minutes}"] = np.sin(2 * np.pi * weekday / 7)
+        frame[f"target_weekday_cos_{target_minutes}"] = np.cos(2 * np.pi * weekday / 7)
 
     frame["quarter_of_day"] = frame["observed_at"].dt.hour * 4 + frame["observed_at"].dt.minute // 15
     frame["day_of_week"] = frame["observed_at"].dt.dayofweek
@@ -90,6 +134,12 @@ def add_features(observations: pd.DataFrame, context: pd.DataFrame) -> pd.DataFr
     feature_columns = [
         *(f"demand_lag_{lag}" for lag in LAGS),
         *(f"demand_mean_{window}" for window in ROLLING_WINDOWS),
+        *(f"demand_std_{window}" for window in ROLLING_STD_WINDOWS),
+        *(
+            f"target_{feature}_{horizon * 15}"
+            for horizon in HORIZONS
+            for feature in ("is_weekend", "quarter_sin", "quarter_cos", "weekday_sin", "weekday_cos")
+        ),
         "rain_forecast",
         "temperature_forecast",
         "event_intensity",
@@ -105,6 +155,30 @@ def add_features(observations: pd.DataFrame, context: pd.DataFrame) -> pd.DataFr
     encoded = pd.get_dummies(frame, columns=["station_id"], dtype=float)
     encoded.insert(encoded.columns.get_loc(TARGET) + 1, "station_id", station_ids)
     return encoded
+
+
+def feature_columns_for_horizon(feature_columns: list[str], horizon_minutes: int) -> list[str]:
+    target_calendar_prefixes = (
+        "target_is_weekend_",
+        "target_quarter_sin_",
+        "target_quarter_cos_",
+        "target_weekday_sin_",
+        "target_weekday_cos_",
+    )
+    return [
+        column for column in feature_columns
+        if not column.startswith(target_calendar_prefixes) or column.endswith(f"_{horizon_minutes}")
+    ]
+
+
+def station_balanced_weights(frame: pd.DataFrame, target_column: str = "target") -> np.ndarray:
+    station_target_sum = frame.groupby("station_id", sort=False)[target_column].transform("sum")
+    if (station_target_sum <= 0).any():
+        raise ValueError("No se pueden calcular pesos WAPE con suma de demanda no positiva.")
+    weights = (1.0 / station_target_sum).to_numpy(dtype=float)
+    # Preserve the effective regularization scale: sample weights should sum to N.
+    weights *= len(weights) / weights.sum()
+    return weights
 
 
 def accuracy_by_station(frame: pd.DataFrame) -> pd.Series:
@@ -192,12 +266,17 @@ def save_best_models(
         horizon_frame = frame.copy()
         horizon_frame["target"] = horizon_frame.groupby("station_id", sort=False)[TARGET].shift(-horizon)
         horizon_frame = horizon_frame.dropna(subset=["target"])
+        horizon_feature_columns = feature_columns_for_horizon(feature_columns, horizon_minutes)
         model = HistGradientBoostingRegressor(
             **MODEL_CONFIGS[model_name],
             early_stopping=False,
             random_state=42,
         )
-        model.fit(horizon_frame[feature_columns], horizon_frame["target"])
+        model.fit(
+            horizon_frame[horizon_feature_columns],
+            horizon_frame["target"],
+            sample_weight=station_balanced_weights(horizon_frame),
+        )
         model_path = BEST_MODEL_DIR / f"horizon_{horizon_minutes}_hgb.pkl"
         config_path = BEST_MODEL_DIR / f"horizon_{horizon_minutes}_ensemble.json"
         with model_path.open("wb") as output:
@@ -209,7 +288,7 @@ def save_best_models(
                     "hgb_model": model_name,
                     "hgb_weight": hgb_weight,
                     "baseline": "Seasonal Naive 7d",
-                    "feature_columns": feature_columns,
+                    "feature_columns": horizon_feature_columns,
                     "training_rows": len(horizon_frame),
                 },
                 indent=2,
@@ -274,12 +353,11 @@ def run_experiment(parent_run_id: str) -> None:
         horizon_frame = frame.copy()
         horizon_frame["target"] = horizon_frame.groupby("station_id", sort=False)[TARGET].shift(-horizon)
         horizon_frame = horizon_frame.dropna(subset=["target"])
-        horizon_feature_columns = [
-            column for column in feature_columns if column in horizon_frame.columns
-        ]
+        horizon_feature_columns = feature_columns_for_horizon(feature_columns, horizon * 15)
         for fold, validation_start in enumerate(fold_starts, start=1):
             validation_end = validation_start + timedelta(days=7)
-            train_cutoff = validation_start - timedelta(minutes=15)
+            # Leave a horizon-sized embargo so training labels cannot overlap validation.
+            train_cutoff = validation_start - timedelta(minutes=(horizon + 1) * 15)
             train = horizon_frame.loc[horizon_frame["observed_at"] <= train_cutoff].copy()
             validation = horizon_frame.loc[
                 (horizon_frame["observed_at"] >= validation_start)
@@ -329,7 +407,11 @@ def run_experiment(parent_run_id: str) -> None:
                         early_stopping=False,
                         random_state=42,
                     )
-                    model.fit(train[horizon_feature_columns], train["target"])
+                    model.fit(
+                        train[horizon_feature_columns],
+                        train["target"],
+                        sample_weight=station_balanced_weights(train),
+                    )
                     predictions = pd.Series(model.predict(validation[horizon_feature_columns]))
                     hgb_predictions[model_name] = predictions
                     rows = score(model_name, fold, horizon, validation, predictions)
@@ -375,9 +457,9 @@ def run_experiment(parent_run_id: str) -> None:
     mlflow.log_artifact(str(report_path), artifact_path="validation")
     ensemble_metrics = metrics[metrics["model"].str.startswith("Ensemble ")]
     ensemble_summary = (
-        ensemble_metrics.groupby(["horizon_minutes", "model"], as_index=False)["accuracy"]
+        ensemble_metrics.groupby(["horizon_minutes", "model"], as_index=False)["wape"]
         .mean()
-        .sort_values(["horizon_minutes", "accuracy"], ascending=[True, False])
+        .sort_values(["horizon_minutes", "wape"], ascending=[True, True])
     )
     best_ensemble = ensemble_summary.groupby("horizon_minutes", as_index=False).first()
     best_model_names = dict(zip(best_ensemble["horizon_minutes"], best_ensemble["model"]))

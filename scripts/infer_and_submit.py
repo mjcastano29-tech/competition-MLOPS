@@ -135,12 +135,33 @@ def _feature_row_for_target(
             last_row = _last_known_row(history, lag_time)
             row[feature] = safe_float(last_row.get("demand"), 0.0) if last_row else 0.0
             continue
-        if feature.startswith("demand_mean_"):
+        if feature.startswith(("demand_mean_", "demand_std_")):
             window = int(feature.split("_")[-1])
             # add_features() uses shift(1).rolling(window), excluding the value
             # at the forecast origin itself.
-            recent = history[history["observed_at"] < data_cutoff].tail(window)
-            row[feature] = safe_float(recent["demand"].mean(), 0.0)
+            recent = history[history["observed_at"] < data_cutoff].tail(window)["demand"]
+            statistic = recent.mean() if feature.startswith("demand_mean_") else recent.std()
+            row[feature] = safe_float(statistic, 0.0)
+            continue
+        if feature.startswith((
+            "target_is_weekend_",
+            "target_quarter_sin_",
+            "target_quarter_cos_",
+            "target_weekday_sin_",
+            "target_weekday_cos_",
+        )):
+            if feature.startswith("target_is_weekend_"):
+                row[feature] = 1.0 if target_at.dayofweek >= 5 else 0.0
+            elif "quarter_sin" in feature:
+                quarter = target_at.hour * 4 + target_at.minute // 15
+                row[feature] = float(np.sin(2 * np.pi * quarter / 96))
+            elif "quarter_cos" in feature:
+                quarter = target_at.hour * 4 + target_at.minute // 15
+                row[feature] = float(np.cos(2 * np.pi * quarter / 96))
+            elif "weekday_sin" in feature:
+                row[feature] = float(np.sin(2 * np.pi * target_at.dayofweek / 7))
+            else:
+                row[feature] = float(np.cos(2 * np.pi * target_at.dayofweek / 7))
             continue
         if feature in {"rain_forecast", "temperature_forecast", "event_intensity"}:
             row[feature] = safe_float(latest_context.get(feature), 0.0)
@@ -171,6 +192,12 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
 
     targets = cycle["targets"]
     data_cutoff = pd.to_datetime(cycle["data_cutoff"])
+    latest_observation = observations.loc[
+        observations["observed_at"] <= data_cutoff, "observed_at"
+    ].max()
+    if pd.notna(latest_observation):
+        history_age_minutes = (data_cutoff - latest_observation).total_seconds() / 60
+        print(f"Antigüedad de la última observación al data_cutoff: {history_age_minutes:.0f} minutos.")
     predictions: list[dict[str, Any]] = []
     loaded_models: dict[int, Any] = {}
     for horizon, (model_path, _) in bundle.items():
@@ -189,7 +216,11 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
             station_id, target_at, data_cutoff, observations, context, config
         )
         frame = pd.DataFrame([feature_row])
-        value = float(model.predict(frame)[0])
+        hgb_value = float(model.predict(frame)[0])
+        hgb_weight = float(config.get("hgb_weight", 1.0))
+        baseline_lag = int(config.get("baseline_lag", 672 - horizon_minutes // 15))
+        seasonal_value = safe_float(feature_row.get(f"demand_lag_{baseline_lag}"), 0.0)
+        value = hgb_weight * hgb_value + (1 - hgb_weight) * seasonal_value
         predictions.append({
             "station_id": station_id,
             "target_at": target["target_at"],
@@ -206,7 +237,7 @@ def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]]) -> d
         "client_run_id": f"gha-{uuid.uuid4().hex}",
         "data_cutoff": cycle["data_cutoff"],
         "model": {
-            "version": "pulso-transmi-best-ensemble-gha",
+            "version": "pulso-transmi-history-gap-aware-hgb",
             "training_data_end": None,
             "git_commit": None,
         },
