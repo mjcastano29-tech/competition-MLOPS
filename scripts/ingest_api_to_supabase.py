@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -49,13 +49,17 @@ class SupabaseRestClient:
     def close(self) -> None:
         self._client.close()
 
-    def upsert(self, table: str, rows: list[dict[str, Any]], conflict_columns: str) -> list[dict[str, Any]]:
+    def upsert(
+        self, table: str, rows: list[dict[str, Any]], conflict_columns: str, *, ignore_duplicates: bool = False
+    ) -> list[dict[str, Any]]:
         if not rows:
             return []
         response = self._client.post(
             f"/{table}",
             params={"on_conflict": conflict_columns},
-            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+            headers={
+                "Prefer": f"resolution={'ignore' if ignore_duplicates else 'merge'}-duplicates,return=representation"
+            },
             json=rows,
         )
         if response.is_error:
@@ -122,6 +126,11 @@ def isoformat(value: Any) -> str:
     return str(value)
 
 
+def canonical_timestamp(value: Any) -> str:
+    raw = isoformat(value).replace("Z", "+00:00")
+    return datetime.fromisoformat(raw).astimezone(timezone.utc).isoformat()
+
+
 def chunks(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return [rows[start : start + BATCH_SIZE] for start in range(0, len(rows), BATCH_SIZE)]
 
@@ -131,10 +140,12 @@ def upsert_in_batches(
     table: str,
     rows: list[dict[str, Any]],
     conflict_columns: str,
+    *,
+    ignore_duplicates: bool = False,
 ) -> None:
     batches = chunks(rows)
     for index, batch in enumerate(batches, start=1):
-        supabase.upsert(table, batch, conflict_columns)
+        supabase.upsert(table, batch, conflict_columns, ignore_duplicates=ignore_duplicates)
         print(f"{table}: lote {index}/{len(batches)} ({len(batch)} filas)")
 
 
@@ -195,6 +206,7 @@ def main() -> None:
                 for row in context_frame.to_dict("records")
             ]
             upsert_in_batches(supabase, "context", context_rows, "observed_at")
+            known_context_times = {canonical_timestamp(row["observed_at"]) for row in context_rows}
 
             observation_count = 0
             if not supabase.has_observations():
@@ -220,6 +232,7 @@ def main() -> None:
             while True:
                 page = api.stream_observations_page(cursor=cursor, limit=STREAM_PAGE_SIZE)
                 stream_rows = []
+                missing_context: dict[str, dict[str, Any]] = {}
                 for row in page.get("data", []):
                     released_at = datetime.fromisoformat(row["released_at"].replace("Z", "+00:00"))
                     if latest_release is None or released_at > latest_release:
@@ -228,12 +241,35 @@ def main() -> None:
                     # records sharing a release timestamp. Upserts are idempotent.
                     if watermark is not None and released_at < watermark:
                         continue
+                    observed_at = canonical_timestamp(row["observed_at"])
                     stream_rows.append({
                         "dataset_id": dataset_id,
                         "station_id": str(row["station_id"]),
-                        "observed_at": isoformat(row["observed_at"]),
+                        "observed_at": observed_at,
                         "demand": int(row["demand"]),
                     })
+                    if observed_at not in known_context_times:
+                        # The API stream can publish demand before its context
+                        # series catches up. Store an explicit all-NULL context
+                        # row to satisfy the FK; never carry stale weather forward.
+                        missing_context[observed_at] = {
+                            "observed_at": observed_at,
+                            "dataset_id": dataset_id,
+                            "rain_mm": None,
+                            "rain_forecast": None,
+                            "temperature_c": None,
+                            "temperature_forecast": None,
+                            "event_intensity": None,
+                        }
+                if missing_context:
+                    upsert_in_batches(
+                        supabase,
+                        "context",
+                        list(missing_context.values()),
+                        "observed_at",
+                        ignore_duplicates=True,
+                    )
+                    known_context_times.update(missing_context)
                 upsert_in_batches(supabase, "observations", stream_rows, "station_id,observed_at")
                 observation_count += len(stream_rows)
                 next_cursor = page.get("next_cursor")
