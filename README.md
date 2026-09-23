@@ -229,17 +229,23 @@ predicciones y rangos antes de enviar a `POST /v1/submissions`. Usa una clave de
 idempotencia automáticamente. La API puede pedir 12 predicciones para un ciclo
 de 15 minutos; siempre debe obedecerse la respuesta del ciclo actual.
 
-El workflow de GitHub Actions en `.github/workflows/forecast_cycle.yml` consulta el
-ciclo cada 10 minutos. En cada ejecución descarga los datos actuales desde la API,
-calcula PSI sobre ventanas recientes, y solo reentrena si no existe un paquete
-cacheado o si el PSI supera `DRIFT_THRESHOLD` (por defecto `0.20`). Si encuentra
-un ciclo abierto genera las predicciones requeridas por los targets del ciclo y
-las envía automáticamente. Requiere el secreto `PULSO_API_KEY`;
-`DRIFT_THRESHOLD` puede configurarse como variable del repositorio. El cache se
-versiona por protocolo de desfase para evitar reutilizar un modelo entrenado con
-un supuesto de disponibilidad distinto. Cuando el protocolo es el mismo, el
-candidato solo se promueve si su WAPE promedio por horizonte mejora; si cambia,
-se registra como nuevo protocolo y `model_promotion.json` documenta la decisión.
+El workflow `.github/workflows/forecast_cycle.yml` consulta ciclos con dos
+horarios escalonados (cada 2–3 minutos nominalmente). Descarga los datos al inicio
+de cada ejecución e intenta enviar solo cuando la API tiene un ciclo abierto. El
+resumen de Actions muestra el `cycle_id`, el número de predicciones y si la API
+confirmó la entrega. Requiere el secreto `PULSO_API_KEY`.
+
+El workflow `.github/workflows/retrain_on_drift.yml` calcula PSI cada media hora.
+Si supera `DRIFT_THRESHOLD` (por defecto `0.20`), vuelve a entrenar, compara el
+candidato con el paquete previo y guarda el paquete aceptado en el cache compartido
+con inferencia. También entrena si todavía no hay un paquete de modelo. La variable
+`DRIFT_THRESHOLD` es configurable en el repositorio.
+
+La descarga de inferencia y el detector de drift usan los datos de la API en cada
+runner; ese espacio de trabajo es temporal. Para persistir las capturas en Supabase
+se necesita configurar `SUPABASE_SERVICE_ROLE_KEY` como secreto y ejecutar
+`scripts/ingest_api_to_supabase.py`. Esa ingesta todavía no tiene un workflow
+programado.
 
 ## Cargar datos en Supabase
 

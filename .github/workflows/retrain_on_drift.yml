@@ -1,0 +1,131 @@
+name: retrain-on-drift
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: pulso-model-retrain
+  cancel-in-progress: false
+
+jobs:
+  evaluate-and-retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
+      PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+      DRIFT_THRESHOLD: ${{ vars.DRIFT_THRESHOLD || '0.20' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[ml]'
+
+      - name: Download current API data
+        run: PYTHONPATH=src python scripts/download_api_data.py
+
+      - name: Restore current model package
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            artifacts/pulso_transmi_best_models
+            artifacts/pulso_transmi_best_models.zip
+          key: pulso-transmi-model-gap133-${{ github.run_id }}
+          restore-keys: |
+            pulso-transmi-model-gap133-
+            pulso-transmi-model-
+
+      - name: Check restored model package
+        id: model_state
+        run: |
+          bundle=artifacts/pulso_transmi_best_models
+          available=true
+          [[ -f "$bundle/best_ensemble_summary.csv" ]] || available=false
+          for horizon in 15 30 45 60; do
+            [[ -f "$bundle/models/horizon_${horizon}_hgb.pkl" ]] || available=false
+            [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || available=false
+          done
+          echo "available=$available" >> "$GITHUB_OUTPUT"
+
+      - name: Detect data drift
+        id: drift
+        run: |
+          PYTHONPATH=src python scripts/detect_drift.py \
+            --threshold "$DRIFT_THRESHOLD" \
+            --output artifacts/drift_report.json
+          drift_detected=$(python3 -c "import json; print(str(json.load(open('artifacts/drift_report.json'))['drift_detected']).lower())")
+          echo "drift_detected=$drift_detected" >> "$GITHUB_OUTPUT"
+
+      - name: Save previous package
+        if: steps.model_state.outputs.available == 'true' && steps.drift.outputs.drift_detected == 'true'
+        run: |
+          cp -a artifacts/pulso_transmi_best_models artifacts/previous_model
+          if [[ -f artifacts/pulso_transmi_best_models.zip ]]; then
+            cp artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip
+          fi
+
+      - name: Retrain and package after drift
+        id: retrain
+        if: steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true'
+        run: |
+          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
+            PYTHONPATH=src python examples/03_gradient_boosting.py
+          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
+            PYTHONPATH=src python examples/04_package_best_model.py
+
+      - name: Promote only if validation improves
+        if: steps.retrain.outcome == 'success' && steps.model_state.outputs.available == 'true'
+        run: |
+          PYTHONPATH=src python scripts/promote_model.py \
+            --candidate artifacts/pulso_transmi_best_models \
+            --previous artifacts/previous_model \
+            --package artifacts/pulso_transmi_best_models \
+            --package-zip artifacts/pulso_transmi_best_models.zip \
+            --output artifacts/model_promotion.json
+
+      - name: Cache retrained model package
+        if: steps.retrain.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            artifacts/pulso_transmi_best_models
+            artifacts/pulso_transmi_best_models.zip
+          key: pulso-transmi-model-gap133-${{ github.run_id }}
+
+      - name: Report retraining outcome
+        if: always()
+        env:
+          MODEL_AVAILABLE: ${{ steps.model_state.outputs.available }}
+          DRIFT_DETECTED: ${{ steps.drift.outputs.drift_detected }}
+          RETRAIN_OUTCOME: ${{ steps.retrain.outcome }}
+        run: |
+          if [[ "$RETRAIN_OUTCOME" == "success" ]]; then
+            echo "Se reentrenó el modelo y se guardó un paquete en cache." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$DRIFT_DETECTED" == "false" && "$MODEL_AVAILABLE" == "true" ]]; then
+            echo "Sin drift sobre el umbral ${DRIFT_THRESHOLD}; se conserva el modelo actual." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Revisa los pasos fallidos para conocer el resultado del reentrenamiento." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload drift and promotion reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-retraining-report
+          path: |
+            artifacts/drift_report.json
+            artifacts/model_promotion.json
+          if-no-files-found: ignore
