@@ -45,7 +45,7 @@ jobs:
 
       - name: Restore cached model package
         id: model_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             artifacts/pulso_transmi_best_models
@@ -112,6 +112,15 @@ jobs:
             --package artifacts/pulso_transmi_best_models \
             --package-zip artifacts/pulso_transmi_best_models.zip \
             --output artifacts/model_promotion.json
+
+      - name: Cache retrained model package
+        if: env.DRY_RUN == 'true' && steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            artifacts/pulso_transmi_best_models
+            artifacts/pulso_transmi_best_models.zip
+          key: pulso-transmi-model-gap133-${{ github.run_id }}
 
       - name: Check whether the cycle is open, generate predictions, and submit
         id: final_submit
