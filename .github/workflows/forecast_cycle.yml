@@ -8,14 +8,14 @@ on:
       dry_run:
         description: 'Entrena y genera el payload sin enviarlo'
         required: true
-        default: true
+        default: false
         type: boolean
 
 jobs:
   poll-and-submit:
     runs-on: ubuntu-latest
     concurrency:
-      group: forecast-cycle-poller
+      group: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'forecast-cycle-dry-run' || 'forecast-cycle-poller' }}
       cancel-in-progress: false
     timeout-minutes: 20
     permissions:
