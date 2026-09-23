@@ -2,7 +2,7 @@ name: forecast-cycle-poller
 
 on:
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -39,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[ml]'
+          python -m pip install -e . scikit-learn
 
       - name: Restore cached model package
         id: model_cache
@@ -71,7 +71,7 @@ jobs:
         run: |
           PYTHONPATH=src python scripts/infer_and_submit.py \
             --output artifacts/current_submission.json \
-            --wait-seconds 90 \
+            --wait-seconds 0 \
             --poll-seconds 30
 
       - name: Check whether the cycle is open, generate predictions, and submit
@@ -82,7 +82,7 @@ jobs:
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
           fi
-          args+=(--wait-seconds 90 --poll-seconds 30)
+          args+=(--wait-seconds 0 --poll-seconds 30)
           PYTHONPATH=src python scripts/infer_and_submit.py "${args[@]}"
 
       - name: Report delivery outcome
