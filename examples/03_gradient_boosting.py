@@ -457,9 +457,9 @@ def run_experiment(parent_run_id: str) -> None:
     mlflow.log_artifact(str(report_path), artifact_path="validation")
     ensemble_metrics = metrics[metrics["model"].str.startswith("Ensemble ")]
     ensemble_summary = (
-        ensemble_metrics.groupby(["horizon_minutes", "model"], as_index=False)["wape"]
+        ensemble_metrics.groupby(["horizon_minutes", "model"], as_index=False)[["accuracy", "wape"]]
         .mean()
-        .sort_values(["horizon_minutes", "wape"], ascending=[True, True])
+        .sort_values(["horizon_minutes", "accuracy"], ascending=[True, False])
     )
     best_ensemble = ensemble_summary.groupby("horizon_minutes", as_index=False).first()
     best_model_names = dict(zip(best_ensemble["horizon_minutes"], best_ensemble["model"]))

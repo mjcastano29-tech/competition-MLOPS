@@ -10,14 +10,14 @@ import pandas as pd
 
 def read_summary(path: Path) -> tuple[float, int]:
     summary = pd.read_csv(path)
-    if "wape" not in summary or summary.empty:
-        raise ValueError(f"Resumen WAPE invalido: {path}")
+    if "accuracy" not in summary or summary.empty:
+        raise ValueError(f"Resumen de accuracy invalido: {path}")
     history_gap_steps = (
         int(summary["history_gap_steps"].mode().iloc[0])
         if "history_gap_steps" in summary
         else 0
     )
-    return float(summary["wape"].mean()), history_gap_steps
+    return float(summary["accuracy"].mean()), history_gap_steps
 
 
 def replace_path(source: Path, destination: Path) -> None:
@@ -34,7 +34,7 @@ def replace_path(source: Path, destination: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Promueve un paquete solo si mejora el WAPE promedio.")
+    parser = argparse.ArgumentParser(description="Promueve un paquete solo si mejora la accuracy de validación temporal.")
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--previous", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
@@ -44,13 +44,13 @@ def main() -> None:
 
     candidate_summary = args.candidate / "best_ensemble_summary.csv"
     previous_summary = args.previous / "best_ensemble_summary.csv"
-    candidate_wape, candidate_gap = read_summary(candidate_summary)
+    candidate_accuracy, candidate_gap = read_summary(candidate_summary)
     if previous_summary.exists():
-        previous_wape, previous_gap = read_summary(previous_summary)
+        previous_accuracy, previous_gap = read_summary(previous_summary)
     else:
-        previous_wape, previous_gap = None, None
+        previous_accuracy, previous_gap = None, None
     protocol_changed = previous_gap is not None and candidate_gap != previous_gap
-    promoted = previous_wape is None or protocol_changed or candidate_wape < previous_wape
+    promoted = previous_accuracy is None or protocol_changed or candidate_accuracy > previous_accuracy
 
     if not promoted:
         replace_path(args.previous, args.package)
@@ -58,13 +58,13 @@ def main() -> None:
 
     report = {
         "promoted": promoted,
-        "candidate_mean_wape": candidate_wape,
-        "previous_mean_wape": previous_wape,
+        "candidate_mean_accuracy": candidate_accuracy,
+        "previous_mean_accuracy": previous_accuracy,
         "candidate_history_gap_steps": candidate_gap,
         "previous_history_gap_steps": previous_gap,
         "reason": (
             "history_gap_protocol_changed" if protocol_changed
-            else "candidate_improves_wape" if promoted
+            else "candidate_improves_accuracy" if promoted
             else "previous_model_retained"
         ),
     }

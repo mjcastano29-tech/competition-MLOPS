@@ -47,9 +47,9 @@ def main() -> None:
         raise RuntimeError("No hay métricas de ensemble disponibles.")
 
     best_summary = (
-        ensemble_metrics.groupby(["horizon_minutes", "model"], as_index=False)["wape"]
+        ensemble_metrics.groupby(["horizon_minutes", "model"], as_index=False)[["accuracy", "wape"]]
         .mean()
-        .sort_values(["horizon_minutes", "wape"])
+        .sort_values(["horizon_minutes", "accuracy"], ascending=[True, False])
         .groupby("horizon_minutes", as_index=False)
         .first()
     )

@@ -24,8 +24,9 @@ jobs:
     env:
       PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://jwlgxabibcticikhjhzf.supabase.co' }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
-      DRIFT_THRESHOLD: ${{ vars.DRIFT_THRESHOLD || '0.20' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,52 +78,6 @@ jobs:
             --wait-seconds 90 \
             --poll-seconds 30
 
-      - name: Detect data drift
-        id: drift
-        if: env.DRY_RUN == 'true' || steps.model_state.outputs.available != 'true'
-        run: |
-          PYTHONPATH=src python scripts/detect_drift.py \
-            --threshold "$DRIFT_THRESHOLD" \
-            --output artifacts/drift_report.json
-          drift_detected=$(python3 -c "import json; print(str(json.load(open('artifacts/drift_report.json'))['drift_detected']).lower())")
-          echo "drift_detected=$drift_detected" >> "$GITHUB_OUTPUT"
-
-      - name: Save previous model for WAPE comparison
-        if: env.DRY_RUN == 'true' && steps.model_state.outputs.available == 'true'
-        run: |
-          rm -rf artifacts/previous_model artifacts/previous_model.zip
-          cp -a artifacts/pulso_transmi_best_models artifacts/previous_model
-          if [[ -f artifacts/pulso_transmi_best_models.zip ]]; then
-            cp -a artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip
-          fi
-
-      - name: Retrain and package after drift
-        if: (env.DRY_RUN == 'true' && steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')) || steps.model_state.outputs.available != 'true'
-        run: |
-          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
-            PYTHONPATH=src python examples/03_gradient_boosting.py
-          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore \
-            PYTHONPATH=src python examples/04_package_best_model.py
-
-      - name: Promote only if WAPE improves
-        if: env.DRY_RUN == 'true' && steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
-        run: |
-          PYTHONPATH=src python scripts/promote_model.py \
-            --candidate artifacts/pulso_transmi_best_models \
-            --previous artifacts/previous_model \
-            --package artifacts/pulso_transmi_best_models \
-            --package-zip artifacts/pulso_transmi_best_models.zip \
-            --output artifacts/model_promotion.json
-
-      - name: Cache retrained model package
-        if: env.DRY_RUN == 'true' && steps.fast_submit.outputs.submitted != 'true' && (steps.model_state.outputs.available != 'true' || steps.drift.outputs.drift_detected == 'true')
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            artifacts/pulso_transmi_best_models
-            artifacts/pulso_transmi_best_models.zip
-          key: pulso-transmi-model-gap133-${{ github.run_id }}
-
       - name: Check whether the cycle is open, generate predictions, and submit
         id: final_submit
         if: steps.fast_submit.outcome == 'skipped' || env.DRY_RUN == 'true'
@@ -141,6 +96,8 @@ jobs:
           FAST_SUBMISSION_ID: ${{ steps.fast_submit.outputs.submission_id }}
           FINAL_SUBMITTED: ${{ steps.final_submit.outputs.submitted }}
           FINAL_SUBMISSION_ID: ${{ steps.final_submit.outputs.submission_id }}
+          FAST_MONITORING_PERSISTED: ${{ steps.fast_submit.outputs.monitoring_persisted }}
+          FINAL_MONITORING_PERSISTED: ${{ steps.final_submit.outputs.monitoring_persisted }}
           DRY_RUN: ${{ env.DRY_RUN }}
         run: |
           if [[ -f artifacts/current_submission.json ]]; then
@@ -156,6 +113,10 @@ jobs:
           elif [[ "$FAST_SUBMITTED" == "true" || "$FINAL_SUBMITTED" == "true" ]]; then
             submission_id="${FAST_SUBMISSION_ID:-$FINAL_SUBMISSION_ID}"
             echo "Entrega oficial confirmada por la API. Submission ID: ${submission_id:-no informado}." >> "$GITHUB_STEP_SUMMARY"
+            monitoring_persisted="${FAST_MONITORING_PERSISTED:-$FINAL_MONITORING_PERSISTED}"
+            if [[ "$monitoring_persisted" != "true" ]]; then
+              echo "Atención: se envió la predicción, pero no se guardó para monitorear WAPE. Revisa SUPABASE_SERVICE_ROLE_KEY y la migración." >> "$GITHUB_STEP_SUMMARY"
+            fi
           elif [[ -f artifacts/current_submission.json ]]; then
             echo "Se generó payload, pero esta ejecución no confirmó una entrega oficial. Revisa el log de infer_and_submit." >> "$GITHUB_STEP_SUMMARY"
           else
@@ -169,6 +130,4 @@ jobs:
           name: current-submission
           path: |
             artifacts/current_submission.json
-            artifacts/drift_report.json
-            artifacts/model_promotion.json
           if-no-files-found: ignore

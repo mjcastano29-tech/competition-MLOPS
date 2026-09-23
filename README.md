@@ -235,17 +235,21 @@ de cada ejecución e intenta enviar solo cuando la API tiene un ciclo abierto. E
 resumen de Actions muestra el `cycle_id`, el número de predicciones y si la API
 confirmó la entrega. Requiere el secreto `PULSO_API_KEY`.
 
-El workflow `.github/workflows/retrain_on_drift.yml` calcula PSI cada media hora.
-Si supera `DRIFT_THRESHOLD` (por defecto `0.20`), vuelve a entrenar, compara el
-candidato con el paquete previo y guarda el paquete aceptado en el cache compartido
-con inferencia. También entrena si todavía no hay un paquete de modelo. La variable
-`DRIFT_THRESHOLD` es configurable en el repositorio.
+El pipeline separa cuatro tareas programadas: `.github/workflows/data_collector.yml`
+guarda observaciones cada 30 minutos; `forecast_cycle.yml` consulta ciclos cada
+2–3 minutos e intenta enviar las predicciones; `wape_drift.yml` compara cada media
+hora el WAPE por estación de dos ventanas consecutivas de siete días, usando solo
+predicciones oficiales con resultado real disponible; y `retrain_on_drift.yml`
+reentrena ante alertas pendientes y conserva la accuracy de validación temporal
+como criterio de promoción. El drift exige por defecto un aumento relativo de WAPE
+de 20%, al menos 120 pares y 10 estaciones en cada ventana.
 
-La descarga de inferencia y el detector de drift usan los datos de la API en cada
-runner; ese espacio de trabajo es temporal. Para persistir las capturas en Supabase
-se necesita configurar `SUPABASE_SERVICE_ROLE_KEY` como secreto y ejecutar
-`scripts/ingest_api_to_supabase.py`. Esa ingesta todavía no tiene un workflow
-programado.
+Aplica las migraciones de `supabase/migrations/` y configura `SUPABASE_SERVICE_ROLE_KEY`
+como secreto en GitHub Actions. Sin ese secreto no se pueden persistir los datos,
+las predicciones ni las alertas WAPE. La tabla de predicciones empieza a llenarse
+cuando se confirma una submission oficial; el monitor necesita dos ventanas con
+resultados maduros (hasta 14 días) antes de poder detectar deterioro. Ajusta
+`WAPE_DRIFT_THRESHOLD` si el umbral relativo de 20% no corresponde a tu operación.
 
 ## Cargar datos en Supabase
 

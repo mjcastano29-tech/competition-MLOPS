@@ -24,7 +24,7 @@ def require_environment() -> tuple[str, str]:
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not service_role_key:
         raise SupabaseIngestionError(
-            "Falta SUPABASE_SERVICE_ROLE_KEY. Configúrala solo en el entorno local."
+            "Falta SUPABASE_SERVICE_ROLE_KEY. Configúrala como secreto SUPABASE_SERVICE_ROLE_KEY en GitHub Actions o como variable local segura."
         )
     return supabase_url, service_role_key
 

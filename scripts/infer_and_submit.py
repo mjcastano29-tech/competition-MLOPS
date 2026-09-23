@@ -320,6 +320,45 @@ def write_github_output(name: str, value: str) -> None:
             output.write(f"{name}={value}\n")
 
 
+def persist_confirmed_predictions(payload: dict[str, Any], submission_id: str | None) -> bool:
+    """Persist only predictions confirmed as official by the competition API."""
+    supabase_url = os.getenv("SUPABASE_URL", "https://jwlgxabibcticikhjhzf.supabase.co").rstrip("/")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not service_key:
+        print("Aviso: falta SUPABASE_SERVICE_ROLE_KEY; el envío fue oficial, pero no se guardará para medir WAPE.")
+        write_github_output("monitoring_persisted", "false")
+        return False
+    cutoff = pd.to_datetime(payload["data_cutoff"], utc=True)
+    rows = []
+    for prediction in payload["predictions"]:
+        target_at = pd.to_datetime(prediction["target_at"], utc=True)
+        rows.append({
+            "cycle_id": str(payload["cycle_id"]),
+            "client_run_id": payload["client_run_id"],
+            "submission_id": submission_id,
+            "station_id": normalize_station_id(prediction["station_id"]),
+            "target_at": target_at.isoformat(),
+            "data_cutoff": cutoff.isoformat(),
+            "horizon_minutes": int((target_at - cutoff).total_seconds() // 60),
+            "predicted_demand": prediction["value"],
+        })
+    response = httpx.post(
+        f"{supabase_url}/rest/v1/forecast_predictions",
+        params={"on_conflict": "cycle_id,station_id,target_at"},
+        headers={"apikey": service_key, "Authorization": f"Bearer {service_key}",
+                 "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+        json=rows,
+        timeout=60.0,
+    )
+    if response.is_error:
+        print(f"Error guardando predicciones para monitoreo WAPE: HTTP {response.status_code} {response.text}")
+        write_github_output("monitoring_persisted", "false")
+        return False
+    print(f"Predicciones oficiales guardadas para monitoreo WAPE: {len(rows)}")
+    write_github_output("monitoring_persisted", "true")
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Consulta el ciclo activo, genera predicciones y envía la submission si el ciclo está abierto.")
     parser.add_argument("--dry-run", action="store_true", help="No envía la submission; solo genera el payload local.")
@@ -366,7 +405,9 @@ def main() -> int:
         is_official = result.get("is_official") is True
         write_github_output("submitted", str(is_official).lower())
         if is_official:
-            write_github_output("submission_id", str(result.get("submission_id", "")))
+            submission_id = str(result.get("submission_id", "")) or None
+            write_github_output("submission_id", submission_id or "")
+            persist_confirmed_predictions(payload, submission_id)
         if not is_official:
             raise RuntimeError("La API respondió sin confirmar is_official=true; revisar la respuesta antes de darlo por entregado.")
         return 0
