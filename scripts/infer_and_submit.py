@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 import time
@@ -31,13 +32,30 @@ def request_headers(api_key: str, idempotency_key: str | None = None) -> dict[st
     return headers
 
 
-def load_cycle(client: httpx.Client, api_key: str) -> dict[str, Any] | None:
-    response = client.get("/v1/forecast-cycles/current", headers=request_headers(api_key))
-    if response.status_code == 404:
-        return None
-    if response.is_error:
-        raise RuntimeError(f"No se pudo consultar el ciclo actual: HTTP {response.status_code} {response.text}")
-    return response.json()
+def load_cycle(client: httpx.Client, api_key: str, attempts: int = 5) -> dict[str, Any] | None:
+    retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+    for attempt in range(attempts):
+        try:
+            response = client.get("/v1/forecast-cycles/current", headers=request_headers(api_key))
+        except httpx.TransportError as exc:
+            if attempt + 1 == attempts:
+                raise RuntimeError(f"No se pudo consultar el ciclo tras {attempts} intentos: {exc}") from exc
+            delay = min(2 ** attempt, 30)
+            print(f"Fallo de red consultando el ciclo; reintento {attempt + 2}/{attempts} en {delay}s.")
+            time.sleep(delay)
+            continue
+        if response.status_code == 404:
+            return None
+        if response.status_code not in retryable_statuses:
+            if response.is_error:
+                raise RuntimeError(f"No se pudo consultar el ciclo actual: HTTP {response.status_code} {response.text}")
+            return response.json()
+        if attempt + 1 == attempts:
+            raise RuntimeError(f"No se pudo consultar el ciclo actual tras {attempts} intentos: HTTP {response.status_code} {response.text}")
+        delay = min(2 ** attempt, 30)
+        print(f"API respondió HTTP {response.status_code} al consultar el ciclo; reintento {attempt + 2}/{attempts} en {delay}s.")
+        time.sleep(delay)
+    raise RuntimeError("Se agotaron los intentos de consulta del ciclo.")
 
 
 def ensure_bundle_ready() -> dict[int, tuple[Path, dict[str, Any]]]:
@@ -92,12 +110,17 @@ def _last_known_row(history: pd.DataFrame, cutoff: pd.Timestamp) -> dict[str, An
 def _feature_row_for_target(
     station_id: str,
     target_at: pd.Timestamp,
+    data_cutoff: pd.Timestamp,
     observations: pd.DataFrame,
     context: pd.DataFrame,
     config: dict[str, Any],
 ) -> dict[str, float]:
-    history = observations[observations["station_id"] == station_id].sort_values("observed_at").copy()
-    historic_context = context[context["observed_at"] <= target_at].sort_values("observed_at")
+    # Training features are indexed by the observation time (forecast origin),
+    # so inference must use the cycle cutoff, not the future target timestamp.
+    history = observations[
+        (observations["station_id"] == station_id) & (observations["observed_at"] <= data_cutoff)
+    ].sort_values("observed_at").copy()
+    historic_context = context[context["observed_at"] <= data_cutoff].sort_values("observed_at")
     latest_context = historic_context.iloc[-1].to_dict() if not historic_context.empty else {}
     feature_columns = config.get("feature_columns", [])
     row: dict[str, float] = {column: 0.0 for column in feature_columns}
@@ -108,21 +131,23 @@ def _feature_row_for_target(
             continue
         if feature.startswith("demand_lag_"):
             lag = int(feature.split("_")[-1])
-            lag_time = target_at - pd.Timedelta(minutes=lag * 15)
+            lag_time = data_cutoff - pd.Timedelta(minutes=lag * 15)
             last_row = _last_known_row(history, lag_time)
             row[feature] = safe_float(last_row.get("demand"), 0.0) if last_row else 0.0
             continue
         if feature.startswith("demand_mean_"):
             window = int(feature.split("_")[-1])
-            recent = history[history["observed_at"] <= target_at].tail(window)
+            # add_features() uses shift(1).rolling(window), excluding the value
+            # at the forecast origin itself.
+            recent = history[history["observed_at"] < data_cutoff].tail(window)
             row[feature] = safe_float(recent["demand"].mean(), 0.0)
             continue
         if feature in {"rain_forecast", "temperature_forecast", "event_intensity"}:
             row[feature] = safe_float(latest_context.get(feature), 0.0)
             continue
         if feature in {"is_weekend", "quarter_sin", "quarter_cos", "weekday_sin", "weekday_cos"}:
-            day_of_week = target_at.dayofweek
-            quarter_of_day = target_at.hour * 4 + target_at.minute // 15
+            day_of_week = data_cutoff.dayofweek
+            quarter_of_day = data_cutoff.hour * 4 + data_cutoff.minute // 15
             if feature == "is_weekend":
                 row[feature] = 1.0 if day_of_week >= 5 else 0.0
             elif feature == "quarter_sin":
@@ -147,6 +172,10 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
     targets = cycle["targets"]
     data_cutoff = pd.to_datetime(cycle["data_cutoff"])
     predictions: list[dict[str, Any]] = []
+    loaded_models: dict[int, Any] = {}
+    for horizon, (model_path, _) in bundle.items():
+        with model_path.open("rb") as stream:
+            loaded_models[horizon] = pickle.load(stream)
     for target in targets:
         station_id = str(target["station_id"])
         target_at = pd.to_datetime(target["target_at"])
@@ -154,11 +183,11 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
         if horizon_minutes not in bundle:
             raise ValueError(f"No hay modelo empaquetado para horizonte de {horizon_minutes} minutos.")
         horizon_key = horizon_minutes
-        model_path, config = bundle[horizon_key]
-        with model_path.open("rb") as stream:
-            model = pickle.load(stream)
-
-        feature_row = _feature_row_for_target(station_id, target_at, observations, context, config)
+        _, config = bundle[horizon_key]
+        model = loaded_models[horizon_key]
+        feature_row = _feature_row_for_target(
+            station_id, target_at, data_cutoff, observations, context, config
+        )
         frame = pd.DataFrame([feature_row])
         value = float(model.predict(frame)[0])
         predictions.append({
@@ -186,6 +215,60 @@ def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]]) -> d
     return payload
 
 
+def validate_predictions(cycle: dict[str, Any], predictions: list[dict[str, Any]]) -> None:
+    expected = cycle.get("targets", [])
+    expected_keys = {(str(target["station_id"]), target["target_at"]) for target in expected}
+    received_keys = [(str(item["station_id"]), item["target_at"]) for item in predictions]
+    expected_count = cycle.get("expected_predictions", len(expected))
+    if len(predictions) != expected_count or len(set(received_keys)) != len(received_keys):
+        raise ValueError(
+            f"Cantidad de predicciones inválida: se esperaban {expected_count} "
+            f"y se generaron {len(predictions)}."
+        )
+    if set(received_keys) != expected_keys:
+        raise ValueError("Las estaciones y fechas de las predicciones no coinciden con los objetivos del ciclo.")
+    for item in predictions:
+        value = item.get("value")
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or value > 100000:
+            raise ValueError(f"Predicción inválida para {item.get('station_id')}: {value}")
+
+
+def submit_with_retries(
+    client: httpx.Client, api_key: str, payload: dict[str, Any], attempts: int = 5
+) -> httpx.Response:
+    retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+    headers = request_headers(api_key, payload["client_run_id"])
+    for attempt in range(attempts):
+        try:
+            response = client.post("/v1/submissions", headers=headers, json=payload)
+        except httpx.TransportError as exc:
+            if attempt + 1 == attempts:
+                raise RuntimeError(f"No se pudo confirmar el envío tras {attempts} intentos: {exc}") from exc
+            delay = min(2 ** attempt, 30)
+            print(f"Fallo de red al enviar; reintento {attempt + 2}/{attempts} en {delay}s.")
+            time.sleep(delay)
+            continue
+        if response.status_code not in retryable_statuses:
+            return response
+        if attempt + 1 == attempts:
+            return response
+        retry_after = response.headers.get("Retry-After")
+        try:
+            delay = min(max(int(retry_after), 1), 60) if retry_after else min(2 ** attempt, 30)
+        except ValueError:
+            delay = min(2 ** attempt, 30)
+        print(f"API respondió HTTP {response.status_code}; reintento {attempt + 2}/{attempts} en {delay}s.")
+        time.sleep(delay)
+    raise RuntimeError("Se agotaron los intentos de envío.")
+
+
+def write_github_output(name: str, value: str) -> None:
+    output_path = os.getenv("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(f"{name}={value}\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Consulta el ciclo activo, genera predicciones y envía la submission si el ciclo está abierto.")
     parser.add_argument("--dry-run", action="store_true", help="No envía la submission; solo genera el payload local.")
@@ -209,26 +292,32 @@ def main() -> int:
             cycle = load_cycle(client, api_key)
         if cycle is None or cycle.get("state") != "open":
             print("No hay un ciclo abierto; la acción termina sin enviar predicciones.")
+            write_github_output("submitted", "false")
             return 0
 
         bundle = ensure_bundle_ready()
         predictions = infer_predictions(cycle, bundle)
+        validate_predictions(cycle, predictions)
         payload = build_payload(cycle, predictions)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Payload generado en {args.output} con {len(predictions)} predicciones.")
 
         if args.dry_run:
+            write_github_output("submitted", "false")
             return 0
 
-        response = client.post(
-            "/v1/submissions",
-            headers=request_headers(api_key, payload["client_run_id"]),
-            json=payload,
-        )
+        response = submit_with_retries(client, api_key, payload)
         if response.is_error:
             raise RuntimeError(f"Submission rechazada: HTTP {response.status_code} {response.text}")
-        print(json.dumps(response.json(), indent=2))
+        result = response.json()
+        print(json.dumps(result, indent=2))
+        is_official = result.get("is_official") is True
+        write_github_output("submitted", str(is_official).lower())
+        if is_official:
+            write_github_output("submission_id", str(result.get("submission_id", "")))
+        if not is_official:
+            raise RuntimeError("La API respondió sin confirmar is_official=true; revisar la respuesta antes de darlo por entregado.")
         return 0
 
 

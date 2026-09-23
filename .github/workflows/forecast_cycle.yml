@@ -16,7 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: forecast-cycle-poller
-      cancel-in-progress: true
+      cancel-in-progress: false
+    timeout-minutes: 20
     permissions:
       contents: read
     env:
@@ -56,26 +57,23 @@ jobs:
       - name: Check restored model package
         id: model_state
         run: |
-          if [[ -f artifacts/pulso_transmi_best_models/best_ensemble_summary.csv ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+          bundle=artifacts/pulso_transmi_best_models
+          available=true
+          [[ -f "$bundle/best_ensemble_summary.csv" ]] || available=false
+          for horizon in 15 30 45 60; do
+            [[ -f "$bundle/models/horizon_${horizon}_hgb.pkl" ]] || available=false
+            [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || available=false
+          done
+          echo "available=$available" >> "$GITHUB_OUTPUT"
 
       - name: Submit immediately with cached model
         id: fast_submit
         if: env.DRY_RUN != 'true' && steps.model_state.outputs.available == 'true'
         run: |
-          result=$(PYTHONPATH=src python scripts/infer_and_submit.py \
+          PYTHONPATH=src python scripts/infer_and_submit.py \
             --output artifacts/current_submission.json \
             --wait-seconds 240 \
-            --poll-seconds 30)
-          printf '%s\n' "$result"
-          if grep -q '"is_official": true' <<< "$result"; then
-            echo "submitted=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "submitted=false" >> "$GITHUB_OUTPUT"
-          fi
+            --poll-seconds 30
 
       - name: Detect data drift
         id: drift
@@ -115,7 +113,8 @@ jobs:
             --output artifacts/model_promotion.json
 
       - name: Check whether the cycle is open, generate predictions, and submit
-        if: steps.fast_submit.outputs.submitted != 'true'
+        id: final_submit
+        if: steps.fast_submit.outcome == 'skipped' || env.DRY_RUN == 'true'
         run: |
           args=(--output artifacts/current_submission.json)
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -123,6 +122,26 @@ jobs:
           fi
           args+=(--wait-seconds 240 --poll-seconds 30)
           PYTHONPATH=src python scripts/infer_and_submit.py "${args[@]}"
+
+      - name: Report delivery outcome
+        if: always()
+        env:
+          FAST_SUBMITTED: ${{ steps.fast_submit.outputs.submitted }}
+          FAST_SUBMISSION_ID: ${{ steps.fast_submit.outputs.submission_id }}
+          FINAL_SUBMITTED: ${{ steps.final_submit.outputs.submitted }}
+          FINAL_SUBMISSION_ID: ${{ steps.final_submit.outputs.submission_id }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run: payload generado sin envío." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$FAST_SUBMITTED" == "true" || "$FINAL_SUBMITTED" == "true" ]]; then
+            submission_id="${FAST_SUBMISSION_ID:-$FINAL_SUBMISSION_ID}"
+            echo "Entrega oficial confirmada por la API. Submission ID: ${submission_id:-no informado}." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f artifacts/current_submission.json ]]; then
+            echo "Se generó payload, pero esta ejecución no confirmó una entrega oficial. Revisa el log de infer_and_submit." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No se generó payload ni se confirmó una entrega oficial." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload generated submission artifact
         if: always()
