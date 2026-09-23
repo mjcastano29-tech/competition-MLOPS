@@ -53,6 +53,7 @@ jobs:
           key: pulso-transmi-model-gap133-${{ github.run_id }}
           restore-keys: |
             pulso-transmi-model-gap133-
+            pulso-transmi-model-
 
       - name: Check restored model package
         id: model_state
