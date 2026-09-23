@@ -13,6 +13,14 @@ DEFAULT_URL = "https://jwlgxabibcticikhjhzf.supabase.co"
 PAGE_SIZE = 1000
 
 
+def supabase_request_headers(api_key: str) -> dict[str, str]:
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+    # New sb_secret keys are API keys, not JWTs; legacy service_role keys are JWTs.
+    if not api_key.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 class Supabase:
     def __init__(self) -> None:
         key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -20,7 +28,7 @@ class Supabase:
             raise RuntimeError("Falta SUPABASE_SERVICE_ROLE_KEY en GitHub Actions.")
         self.client = httpx.Client(
             base_url=os.getenv("SUPABASE_URL", DEFAULT_URL).rstrip("/") + "/rest/v1",
-            headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            headers=supabase_request_headers(key),
             timeout=60,
         )
 

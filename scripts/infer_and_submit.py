@@ -320,6 +320,14 @@ def write_github_output(name: str, value: str) -> None:
             output.write(f"{name}={value}\n")
 
 
+def supabase_request_headers(api_key: str) -> dict[str, str]:
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+    # New sb_secret keys are API keys, not JWTs; legacy service_role keys are JWTs.
+    if not api_key.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def persist_confirmed_predictions(payload: dict[str, Any], submission_id: str | None) -> bool:
     """Persist only predictions confirmed as official by the competition API."""
     supabase_url = os.getenv("SUPABASE_URL", "https://jwlgxabibcticikhjhzf.supabase.co").rstrip("/")
@@ -345,8 +353,7 @@ def persist_confirmed_predictions(payload: dict[str, Any], submission_id: str | 
     response = httpx.post(
         f"{supabase_url}/rest/v1/forecast_predictions",
         params={"on_conflict": "cycle_id,station_id,target_at"},
-        headers={"apikey": service_key, "Authorization": f"Bearer {service_key}",
-                 "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal"},
+        headers={**supabase_request_headers(service_key), "Prefer": "resolution=merge-duplicates,return=minimal"},
         json=rows,
         timeout=60.0,
     )

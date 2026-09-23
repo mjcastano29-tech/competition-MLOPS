@@ -19,6 +19,14 @@ class SupabaseIngestionError(RuntimeError):
     pass
 
 
+def supabase_request_headers(api_key: str) -> dict[str, str]:
+    headers = {"apikey": api_key, "Content-Type": "application/json"}
+    # New sb_secret keys are API keys, not JWTs; legacy service_role keys are JWTs.
+    if not api_key.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def require_environment() -> tuple[str, str]:
     supabase_url = os.getenv("SUPABASE_URL", DEFAULT_SUPABASE_URL).rstrip("/")
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -33,11 +41,7 @@ class SupabaseRestClient:
     def __init__(self, base_url: str, service_role_key: str) -> None:
         self._client = httpx.Client(
             base_url=f"{base_url}/rest/v1",
-            headers={
-                "apikey": service_role_key,
-                "Authorization": f"Bearer {service_role_key}",
-                "Content-Type": "application/json",
-            },
+            headers=supabase_request_headers(service_role_key),
             timeout=60.0,
         )
 
