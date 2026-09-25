@@ -1,8 +1,9 @@
 name: wape-drift-monitor
 
 on:
-  schedule:
-    - cron: '17,47 * * * *'
+  workflow_run:
+    workflows: ["data-collector"]
+    types: [completed]
   workflow_dispatch:
 
 concurrency:
@@ -11,6 +12,7 @@ concurrency:
 
 jobs:
   monitor:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
