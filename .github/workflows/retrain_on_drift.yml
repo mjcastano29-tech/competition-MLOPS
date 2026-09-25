@@ -1,8 +1,6 @@
 name: retrain-on-wape-drift
 
 on:
-  schedule:
-    - cron: '7,37 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -55,7 +53,7 @@ jobs:
           done
           echo "available=$available" >> "$GITHUB_OUTPUT"
       - name: Download current collected data from Supabase
-        if: steps.pending.outputs.drift_pending == 'true' || steps.model_state.outputs.available != 'true'
+        if: steps.pending.outputs.drift_pending == 'true'
         run: python scripts/download_supabase_data.py
       - name: Preserve prior package
         if: steps.pending.outputs.drift_pending == 'true' && steps.model_state.outputs.available == 'true'
@@ -64,7 +62,7 @@ jobs:
           if [[ -f artifacts/pulso_transmi_best_models.zip ]]; then cp artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip; fi
       - name: Train candidate using temporal validation accuracy
         id: train
-        if: steps.pending.outputs.drift_pending == 'true' || steps.model_state.outputs.available != 'true'
+        if: steps.pending.outputs.drift_pending == 'true'
         run: |
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/03_gradient_boosting.py
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/04_package_best_model.py

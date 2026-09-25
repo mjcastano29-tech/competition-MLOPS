@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#f5f7f4" />
+  <title>Pulso TransMi · Model observatory</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <aside class="rail">
+    <a class="brand" href="#top" aria-label="Pulso TransMi inicio"><span class="brand-mark">p</span><span>pulso<span class="brand-light">/transmi</span></span></a>
+    <div class="rail-rule"></div>
+    <a class="rail-link active" href="#overview" aria-label="Overview"><span>◫</span></a>
+    <a class="rail-link" href="#stations" aria-label="Estaciones"><span>⌖</span></a>
+    <a class="rail-link" href="#health" aria-label="Salud del modelo"><span>⌁</span></a>
+    <div class="rail-bottom"><span class="live-dot"></span></div>
+  </aside>
+  <main id="top">
+    <header class="topbar"><div class="crumb">OBSERVABILIDAD <span>/</span> <b>ACCURACY</b></div><div class="top-meta"><span class="live-label"><i></i> EN VIVO</span><span class="top-divider"></span><span id="updated">Actualizando…</span><button id="refresh" title="Actualizar datos" aria-label="Actualizar datos">↻</button></div></header>
+    <section class="intro" id="overview"><div><div class="eyebrow"><span class="eyebrow-line"></span> RETO MLOPS · BOGOTÁ</div><h1>Model<br><em>observatory.</em></h1><p class="lede">El pulso de tus predicciones, estación por estación.</p></div><div class="intro-side"><span class="side-label">FUENTE DE EVALUACIÓN</span><strong>Submissions oficiales</strong><span>Solo targets con demanda real disponible</span><div class="freshness"><i></i><span id="freshness">Esperando la primera sincronización</span></div></div></section>
+    <section class="kpis" aria-label="Resumen de accuracy">
+      <article class="kpi kpi-primary"><div class="kpi-head"><span>ACCURACY · HISTORIAL OFICIAL</span><span class="kpi-icon">↗</span></div><div id="cumulative" class="kpi-value">—<small>%</small></div><div class="kpi-foot"><span class="status-chip"><i></i> OFICIAL</span><span id="sample-count">Sin muestras evaluadas</span></div><div class="kpi-glow"></div></article>
+      <article class="kpi"><div class="kpi-head"><span>ROLLING · 24H</span><span class="kpi-period">ÚLTIMAS 24 HORAS</span></div><div id="rolling" class="kpi-value">—<small>%</small></div><div class="kpi-foot"><span class="kpi-note">Ventana móvil por estación</span><span id="rolling-wape">WAPE —</span></div></article>
+      <article class="kpi"><div class="kpi-head"><span>COBERTURA</span><span class="kpi-icon muted">⌖</span></div><div id="coverage" class="kpi-value">—<small>/ 12</small></div><div class="kpi-foot"><span class="kpi-note">Estaciones con pares evaluados</span><span id="last-target">Target —</span></div></article>
+      <article class="kpi kpi-health"><div class="kpi-head"><span>SEÑAL DE DRIFT</span><span id="drift-icon" class="drift-icon">⌁</span></div><div id="drift-status" class="health-value">Sin datos</div><div class="kpi-foot"><span id="drift-detail" class="kpi-note">El monitor compara ventanas de 7 días</span></div></article>
+    </section>
+    <section class="main-grid">
+      <article class="panel chart-panel"><div class="panel-heading"><div><div class="section-index">01 <span>·</span> TENDENCIA</div><h2>Accuracy en el tiempo</h2><p>Promedio por estación · últimos 14 días</p></div><span class="chart-legend"><i></i> ACCURACY</span></div><div class="chart-wrap"><div class="y-labels"><span>100%</span><span>75%</span><span>50%</span><span>25%</span><span>0%</span></div><div id="accuracy-chart" class="chart" role="img" aria-label="Gráfico de accuracy diaria"></div></div><div class="chart-caption"><span>UTC · DÍA DEL TARGET</span><span id="trend-caption">Se calcula al madurar resultados</span></div></article>
+      <article class="panel error-panel"><div class="panel-heading"><div><div class="section-index">02 <span>·</span> PRECISIÓN</div><h2>Distribución del error</h2><p>Error absoluto relativo a la demanda real</p></div><span class="panel-menu">···</span></div><div id="error-chart" class="error-chart"></div><div class="error-foot"><span><i class="legend-good"></i> Error menor</span><span><i class="legend-bad"></i> Error mayor</span></div></article>
+    </section>
+    <section class="bottom-grid" id="stations">
+      <article class="panel station-panel"><div class="panel-heading"><div><div class="section-index">03 <span>·</span> GEOGRAFÍA</div><h2>Desempeño por estación</h2><p>Vista esquemática · accuracy acumulada</p></div><span class="map-tag">BOGOTÁ D.C.</span></div><div class="station-content"><div id="station-map" class="station-map" role="img" aria-label="Vista esquemática de accuracy por estación"></div><div class="station-list-wrap"><div class="station-list-header"><span>ESTACIÓN</span><span>ACCURACY</span></div><div id="station-list" class="station-list"></div></div></div></article>
+      <article class="panel health-panel" id="health"><div class="panel-heading"><div><div class="section-index">04 <span>·</span> OPERACIÓN</div><h2>Salud del pipeline</h2><p>Metadatos registrados en Supabase</p></div><span class="health-orb">✳</span></div><div class="model-card"><div class="model-label"><span>CHAMPION REGISTRADO EN SUPABASE</span><i id="model-indicator"></i></div><strong id="model-version">Sin modelo activo</strong><div id="model-commit" class="model-commit">Versiones se muestran al registrarlas</div></div><div class="run-row"><span class="run-symbol">↻</span><div class="run-copy"><span>ÚLTIMO RUN REGISTRADO EN SUPABASE</span><strong id="run-status">Sin ejecuciones</strong></div><span id="run-time" class="run-time">—</span></div><div class="leaderboard"><div class="leader-icon">◎</div><div><span>LEADERBOARD</span><strong id="leaderboard-status">Posición no disponible</strong><small>La API aún no expone el leaderboard</small></div><span class="leader-arrow">↗</span></div></article>
+    </section>
+    <footer><span>BUILT FOR THE PULSE OF BOGOTÁ <b>✳</b></span><span>AUTO-REFRESH · 1 MIN <span class="footer-dot"></span></span></footer>
+    <div id="notice" class="notice" role="status" aria-live="polite"></div>
+  </main>
+  <script src="./config.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
