@@ -163,7 +163,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Monitorea degradación de WAPE con predicciones oficiales ya maduras.")
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check")
-    check.add_argument("--threshold", type=float, default=-0.05, help="Cambio relativo mínimo de WAPE; -0.05 activa con WAPE reciente >= 95% de la referencia.")
+    check.add_argument("--threshold", type=float, default=0.05, help="Aumento relativo mínimo de WAPE; 0.05 activa con WAPE reciente >= 105% de la referencia.")
     check.add_argument("--window-days", type=int, default=7)
     check.add_argument("--min-samples", type=int, default=120)
     check.add_argument("--min-stations", type=int, default=10)

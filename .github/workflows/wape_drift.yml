@@ -21,7 +21,7 @@ jobs:
     env:
       SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://jwlgxabibcticikhjhzf.supabase.co' }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      WAPE_DRIFT_THRESHOLD: ${{ vars.WAPE_DRIFT_THRESHOLD || '-0.05' }}
+      WAPE_DRIFT_THRESHOLD: ${{ vars.WAPE_DRIFT_THRESHOLD || '0.05' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
