@@ -68,33 +68,49 @@ def wape(pairs: list[tuple[str, float, float]]) -> float | None:
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
     supabase = Supabase()
     now = datetime.now(timezone.utc)
-    # Allow time for the half-hour collector to ingest the realized target.
-    mature_before = now - timedelta(minutes=args.maturity_minutes)
-    current_start = mature_before - timedelta(days=args.window_days)
-    reference_start = current_start - timedelta(days=args.window_days)
+    # Pulso's target timestamps can lag the wall clock by days. A target is
+    # mature when its actual observation exists in Supabase; anchor windows to
+    # the latest joined prediction/actual pair instead of now().
     predictions = supabase.rows("forecast_predictions", {
         "select": "cycle_id,station_id,target_at,predicted_demand",
         "submission_id": "not.is.null",
-        "target_at": f"gte.{reference_start.isoformat()}",
         "order": "target_at.asc",
     })
     actuals = supabase.rows("observations", {
         "select": "station_id,observed_at,demand",
-        "observed_at": f"gte.{reference_start.isoformat()}",
-        "and": f"(observed_at.lt.{mature_before.isoformat()})",
         "order": "observed_at.asc",
     })
-    actual_by_key = {(str(row["station_id"]), timestamp(row["observed_at"])): float(row["demand"]) for row in actuals}
-    reference: list[tuple[str, float, float]] = []
-    current: list[tuple[str, float, float]] = []
+    actual_by_key = {
+        (str(row["station_id"]), timestamp(row["observed_at"])): float(row["demand"])
+        for row in actuals
+    }
+    matured_pairs: list[tuple[datetime, str, float, float]] = []
     for prediction in predictions:
         target = timestamp(prediction["target_at"])
         key = (str(prediction["station_id"]), target)
         actual = actual_by_key.get(key)
-        if actual is None or target >= mature_before:
-            continue
-        pair = (key[0], float(prediction["predicted_demand"]), actual)
-        (current if target >= current_start else reference).append(pair)
+        if actual is not None:
+            matured_pairs.append((target, key[0], float(prediction["predicted_demand"]), actual))
+
+    latest_mature_target = max((pair[0] for pair in matured_pairs), default=None)
+    if latest_mature_target is None:
+        current_end = now
+        current_start = current_end - timedelta(days=args.window_days)
+        reference_start = current_start - timedelta(days=args.window_days)
+        reference: list[tuple[str, float, float]] = []
+        current: list[tuple[str, float, float]] = []
+    else:
+        current_end = latest_mature_target
+        current_start = current_end - timedelta(days=args.window_days)
+        reference_start = current_start - timedelta(days=args.window_days)
+        reference = []
+        current = []
+        for target, station_id, predicted, actual in matured_pairs:
+            pair = (station_id, predicted, actual)
+            if reference_start <= target < current_start:
+                reference.append(pair)
+            elif current_start <= target <= current_end:
+                current.append(pair)
 
     reference_wape = wape(reference)
     current_wape = wape(current)
@@ -112,9 +128,10 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
         "metric": "WAPE",
         "threshold_relative_increase": args.threshold,
         "window_days": args.window_days,
-        "maturity_minutes": args.maturity_minutes,
+        "maturity_rule": "exact target observation exists in Supabase",
+        "latest_mature_target_at": latest_mature_target.isoformat() if latest_mature_target else None,
         "reference_window": {"start": reference_start.isoformat(), "end": current_start.isoformat(), "samples": len(reference), "stations": reference_stations, "wape": reference_wape},
-        "current_window": {"start": current_start.isoformat(), "end": mature_before.isoformat(), "samples": len(current), "stations": current_stations, "wape": current_wape},
+        "current_window": {"start": current_start.isoformat(), "end": current_end.isoformat(), "samples": len(current), "stations": current_stations, "wape": current_wape},
         "relative_increase": relative,
         "minimum_samples_per_window": args.min_samples,
         "minimum_stations_per_window": args.min_stations,
@@ -124,7 +141,7 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
     }
     supabase.insert("wape_drift_checks", {
         "current_window_start": current_start.isoformat(),
-        "current_window_end": mature_before.isoformat(),
+        "current_window_end": current_end.isoformat(),
         "reference_wape": reference_wape,
         "current_wape": current_wape,
         "relative_increase": relative,
@@ -167,7 +184,10 @@ def main() -> int:
     check.add_argument("--window-days", type=int, default=7)
     check.add_argument("--min-samples", type=int, default=120)
     check.add_argument("--min-stations", type=int, default=10)
-    check.add_argument("--maturity-minutes", type=int, default=45)
+    check.add_argument(
+        "--maturity-minutes", type=int, default=45,
+        help="Compatibilidad; la madurez se determina por la existencia de la realidad observada.",
+    )
     check.add_argument("--output", default="artifacts/wape_drift_report.json")
     sub.add_parser("pending")
     finish = sub.add_parser("mark")
