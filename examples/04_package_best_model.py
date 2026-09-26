@@ -124,6 +124,7 @@ def main() -> None:
                 "training_rows": len(horizon_frame),
                 "station_count": 12,
                 "history_gap_steps": module.TRAINING_HISTORY_GAP_STEPS,
+                "recency_half_life_days": module.RECENCY_HALF_LIFE_DAYS,
                 "mlflow_run_id": run.info.run_id,
             }
             config_path = PACKAGE_DIR / "configs" / f"horizon_{horizon_minutes}_ensemble.json"
@@ -145,6 +146,7 @@ def main() -> None:
             "training_data_end": training_data_end,
             "mlflow_run_id": run.info.run_id,
             "metric": "WAPE per station, mean across 12 stations",
+            "recency_half_life_days": module.RECENCY_HALF_LIFE_DAYS,
             "horizons_minutes": sorted(int(value) for value in best_names),
             "files": {str(path.relative_to(PACKAGE_DIR)): sha256(path) for path in files},
         }

@@ -22,6 +22,7 @@ HORIZONS = (1, 2, 3, 4)
 TRAINING_HISTORY_GAP_STEPS = 133
 ENSEMBLE_WEIGHTS = (0.85, 0.9, 0.95, 1.0)
 EXPECTED_STATION_COUNT = 12
+RECENCY_HALF_LIFE_DAYS = 14.0
 MLFLOW_EXPERIMENT = "pulso-transmi-forecasting"
 BEST_MODEL_DIR = Path("artifacts/models")
 MODEL_CONFIGS = {
@@ -171,12 +172,24 @@ def feature_columns_for_horizon(feature_columns: list[str], horizon_minutes: int
     ]
 
 
-def station_balanced_weights(frame: pd.DataFrame, target_column: str = "target") -> np.ndarray:
-    station_target_sum = frame.groupby("station_id", sort=False)[target_column].transform("sum")
+def station_balanced_weights(
+    frame: pd.DataFrame,
+    target_column: str = "target",
+    half_life_days: float = RECENCY_HALF_LIFE_DAYS,
+) -> np.ndarray:
+    if half_life_days <= 0:
+        raise ValueError("half_life_days debe ser positivo.")
+    observed_at = pd.to_datetime(frame["observed_at"], utc=True)
+    age_days = (observed_at.max() - observed_at).dt.total_seconds() / 86400
+    recency = np.power(0.5, age_days.to_numpy(dtype=float) / half_life_days)
+    weighted_target = pd.to_numeric(frame[target_column], errors="coerce").to_numpy(dtype=float) * recency
+    station_target_sum = pd.Series(weighted_target, index=frame.index).groupby(
+        frame["station_id"], sort=False
+    ).transform("sum")
     if (station_target_sum <= 0).any():
         raise ValueError("No se pueden calcular pesos WAPE con suma de demanda no positiva.")
-    weights = (1.0 / station_target_sum).to_numpy(dtype=float)
-    # Preserve the effective regularization scale: sample weights should sum to N.
+    weights = recency / station_target_sum.to_numpy(dtype=float)
+    # Equalize station-level weighted WAPE while preserving the estimator scale.
     weights *= len(weights) / weights.sum()
     return weights
 
