@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_API_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
 BUNDLE_DIR = ROOT / "artifacts" / "pulso_transmi_best_models"
 BUNDLE_ZIP = ROOT / "artifacts" / "pulso_transmi_best_models.zip"
+# Legacy Actions cache entries use the gap133 cache namespace but predate
+# history_gap_steps in each per-horizon JSON config.
+DEFAULT_HISTORY_GAP_STEPS = 133
 SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
@@ -122,11 +125,13 @@ def _feature_row_for_target(
     # add_features() deliberately reads demand/context only as far as
     # observed_at - history_gap_steps * 15 minutes; mirror that at inference.
     if "history_gap_steps" not in config:
-        raise ValueError(
-            "El bundle no declara history_gap_steps; vuelve a empaquetar el modelo "
-            "con examples/04_package_best_model.py antes de inferir."
+        history_gap_steps = DEFAULT_HISTORY_GAP_STEPS
+        print(
+            "Bundle heredado sin history_gap_steps; uso 133 pasos, "
+            "el desfase del paquete gap133 de Actions."
         )
-    history_gap_steps = int(config["history_gap_steps"])
+    else:
+        history_gap_steps = int(config["history_gap_steps"])
     if history_gap_steps < 0:
         raise ValueError("history_gap_steps no puede ser negativo.")
     feature_data_cutoff = data_cutoff - pd.Timedelta(minutes=history_gap_steps * 15)
