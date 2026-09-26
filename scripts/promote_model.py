@@ -50,7 +50,11 @@ def main() -> None:
     else:
         previous_accuracy, previous_gap = None, None
     protocol_changed = previous_gap is not None and candidate_gap != previous_gap
-    promoted = previous_accuracy is None or protocol_changed or candidate_accuracy > previous_accuracy
+    # Accuracy values are comparable only when both summaries use the same
+    # history-gap protocol and validation setup. Fail closed on protocol changes.
+    promoted = previous_accuracy is None or (
+        not protocol_changed and candidate_accuracy > previous_accuracy
+    )
 
     if not promoted:
         replace_path(args.previous, args.package)
@@ -63,7 +67,8 @@ def main() -> None:
         "candidate_history_gap_steps": candidate_gap,
         "previous_history_gap_steps": previous_gap,
         "reason": (
-            "history_gap_protocol_changed" if protocol_changed
+            "first_model" if previous_accuracy is None
+            else "history_gap_protocol_changed_requires_comparable_validation" if protocol_changed
             else "candidate_improves_accuracy" if promoted
             else "previous_model_retained"
         ),

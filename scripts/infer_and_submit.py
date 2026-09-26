@@ -95,7 +95,8 @@ def ensure_bundle_ready() -> dict[int, tuple[Path, dict[str, Any]]]:
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else default
     except (TypeError, ValueError):
         return default
 
@@ -117,14 +118,40 @@ def _feature_row_for_target(
     context: pd.DataFrame,
     config: dict[str, Any],
 ) -> dict[str, float]:
-    # Training features are indexed by the observation time (forecast origin),
-    # so inference must use the cycle cutoff, not the future target timestamp.
+    # Training features are indexed by the observation time (forecast origin).
+    # add_features() deliberately reads demand/context only as far as
+    # observed_at - history_gap_steps * 15 minutes; mirror that at inference.
+    if "history_gap_steps" not in config:
+        raise ValueError(
+            "El bundle no declara history_gap_steps; vuelve a empaquetar el modelo "
+            "con examples/04_package_best_model.py antes de inferir."
+        )
+    history_gap_steps = int(config["history_gap_steps"])
+    if history_gap_steps < 0:
+        raise ValueError("history_gap_steps no puede ser negativo.")
+    feature_data_cutoff = data_cutoff - pd.Timedelta(minutes=history_gap_steps * 15)
     history = observations[
-        (observations["station_id"] == station_id) & (observations["observed_at"] <= data_cutoff)
+        (observations["station_id"] == station_id)
+        & (observations["observed_at"] <= feature_data_cutoff)
     ].sort_values("observed_at").copy()
-    historic_context = context[context["observed_at"] <= data_cutoff].sort_values("observed_at")
-    latest_context = historic_context.iloc[-1].to_dict() if not historic_context.empty else {}
+    # Training joins context on the exact feature-availability timestamp.
+    matching_context = context[context["observed_at"] == feature_data_cutoff]
+    available_context = matching_context.iloc[-1].to_dict() if not matching_context.empty else {}
     feature_columns = config.get("feature_columns", [])
+    context_features = {"rain_forecast", "temperature_forecast", "event_intensity"}.intersection(feature_columns)
+    missing_context = sorted(
+        feature for feature in context_features
+        if feature not in available_context or pd.isna(available_context[feature])
+    )
+    if missing_context:
+        raise RuntimeError(
+            f"Contexto incompleto para {station_id} en {feature_data_cutoff}: "
+            + ", ".join(missing_context)
+        )
+    if history.empty:
+        raise RuntimeError(
+            f"No hay historial de demanda para {station_id} hasta {feature_data_cutoff}."
+        )
     row: dict[str, float] = {column: 0.0 for column in feature_columns}
 
     for feature in feature_columns:
@@ -133,17 +160,30 @@ def _feature_row_for_target(
             continue
         if feature.startswith("demand_lag_"):
             lag = int(feature.split("_")[-1])
-            lag_time = data_cutoff - pd.Timedelta(minutes=lag * 15)
+            lag_time = data_cutoff - pd.Timedelta(minutes=max(lag, history_gap_steps) * 15)
             last_row = _last_known_row(history, lag_time)
-            row[feature] = safe_float(last_row.get("demand"), 0.0) if last_row else 0.0
+            if last_row is None or pd.isna(last_row.get("demand")):
+                raise RuntimeError(
+                    f"Falta {feature} para {station_id} hasta {lag_time}; "
+                    "no se enviará una predicción con variables imputadas."
+                )
+            row[feature] = safe_float(last_row["demand"])
             continue
         if feature.startswith(("demand_mean_", "demand_std_")):
             window = int(feature.split("_")[-1])
-            # add_features() uses shift(1).rolling(window), excluding the value
-            # at the forecast origin itself.
-            recent = history[history["observed_at"] < data_cutoff].tail(window)["demand"]
+            # add_features() uses shift(max(1, gap)).rolling(window), so the
+            # window ends at the last observation available at the gap cutoff.
+            rolling_cutoff = data_cutoff - pd.Timedelta(minutes=max(1, history_gap_steps) * 15)
+            recent = history[history["observed_at"] <= rolling_cutoff].tail(window)["demand"]
+            if len(recent) < window:
+                raise RuntimeError(
+                    f"Historial insuficiente para {feature} de {station_id}: "
+                    f"{len(recent)}/{window} observaciones."
+                )
             statistic = recent.mean() if feature.startswith("demand_mean_") else recent.std()
-            row[feature] = safe_float(statistic, 0.0)
+            if not math.isfinite(float(statistic)):
+                raise RuntimeError(f"Variable no finita al calcular {feature} para {station_id}.")
+            row[feature] = float(statistic)
             continue
         if feature.startswith((
             "target_is_weekend_",
@@ -166,7 +206,7 @@ def _feature_row_for_target(
                 row[feature] = float(np.cos(2 * np.pi * target_at.dayofweek / 7))
             continue
         if feature in {"rain_forecast", "temperature_forecast", "event_intensity"}:
-            row[feature] = safe_float(latest_context.get(feature), 0.0)
+            row[feature] = safe_float(available_context.get(feature), 0.0)
             continue
         if feature in {"is_weekend", "quarter_sin", "quarter_cos", "weekday_sin", "weekday_cos"}:
             day_of_week = data_cutoff.dayofweek
@@ -190,6 +230,12 @@ def _feature_row_for_target(
 def normalize_station_id(value: Any) -> str:
     station_id = str(value).strip()
     return station_id.zfill(5) if station_id.isdigit() else station_id
+
+
+def normalize_target_key(value: Any) -> str:
+    if isinstance(value, str):
+        return value.replace("Z", "+00:00")
+    return str(value)
 
 
 def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
