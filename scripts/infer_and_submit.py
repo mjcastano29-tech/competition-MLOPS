@@ -139,20 +139,30 @@ def _feature_row_for_target(
         (observations["station_id"] == station_id)
         & (observations["observed_at"] <= feature_data_cutoff)
     ].sort_values("observed_at").copy()
-    # Training joins context on the exact feature-availability timestamp.
-    matching_context = context[context["observed_at"] == feature_data_cutoff]
-    available_context = matching_context.iloc[-1].to_dict() if not matching_context.empty else {}
     feature_columns = config.get("feature_columns", [])
-    context_features = {"rain_forecast", "temperature_forecast", "event_intensity"}.intersection(feature_columns)
-    missing_context = sorted(
-        feature for feature in context_features
-        if feature not in available_context or pd.isna(available_context[feature])
+    context_features = sorted(
+        {"rain_forecast", "temperature_forecast", "event_intensity"}.intersection(feature_columns)
     )
-    if missing_context:
-        raise RuntimeError(
-            f"Contexto incompleto para {station_id} en {feature_data_cutoff}: "
-            + ", ".join(missing_context)
-        )
+    available_context = {}
+    if context_features:
+        historic_context = context[
+            (context["observed_at"] <= feature_data_cutoff)
+            & context[context_features].notna().all(axis=1)
+        ].sort_values("observed_at")
+        if not historic_context.empty:
+            available_context = historic_context.iloc[-1].to_dict()
+            context_at = available_context["observed_at"]
+            if context_at < feature_data_cutoff:
+                age_minutes = (feature_data_cutoff - context_at).total_seconds() / 60
+                print(
+                    f"Contexto {station_id}: uso el último registro completo, "
+                    f"{age_minutes:.0f} min anterior al corte de variables."
+                )
+        else:
+            print(
+                f"Advertencia: sin contexto completo para {station_id} hasta "
+                f"{feature_data_cutoff}; las variables de contexto usarán 0."
+            )
     if history.empty:
         raise RuntimeError(
             f"No hay historial de demanda para {station_id} hasta {feature_data_cutoff}."
