@@ -24,6 +24,8 @@ BUNDLE_ZIP = ROOT / "artifacts" / "pulso_transmi_best_models.zip"
 # Legacy Actions cache entries use the gap133 cache namespace but predate
 # history_gap_steps in each per-horizon JSON config.
 DEFAULT_HISTORY_GAP_STEPS = 133
+MAX_CONTEXT_AGE_MINUTES = 60
+CONTEXT_FALLBACK_DAYS = 7
 SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
@@ -143,25 +145,38 @@ def _feature_row_for_target(
     context_features = sorted(
         {"rain_forecast", "temperature_forecast", "event_intensity"}.intersection(feature_columns)
     )
-    available_context = {}
+    context_values: dict[str, float] = {}
     if context_features:
         historic_context = context[
-            (context["observed_at"] <= feature_data_cutoff)
-            & context[context_features].notna().all(axis=1)
+            context["observed_at"] <= feature_data_cutoff
         ].sort_values("observed_at")
-        if not historic_context.empty:
-            available_context = historic_context.iloc[-1].to_dict()
-            context_at = available_context["observed_at"]
-            if context_at < feature_data_cutoff:
-                age_minutes = (feature_data_cutoff - context_at).total_seconds() / 60
-                print(
-                    f"Contexto {station_id}: uso el último registro completo, "
-                    f"{age_minutes:.0f} min anterior al corte de variables."
-                )
-        else:
+        complete_context = historic_context.dropna(subset=context_features)
+        context_is_fresh = False
+        if not complete_context.empty:
+            latest_context = complete_context.iloc[-1]
+            age_minutes = (feature_data_cutoff - latest_context["observed_at"]).total_seconds() / 60
+            context_is_fresh = age_minutes <= MAX_CONTEXT_AGE_MINUTES
+            if context_is_fresh:
+                context_values = {
+                    feature: safe_float(latest_context.get(feature), 0.0)
+                    for feature in context_features
+                }
+        if not context_is_fresh:
+            # Old weather/event context must not be carried forward indefinitely.
+            # Replace it with recent historical medians, and use neutral defaults
+            # only when a feature has no usable history. This path never aborts
+            # inference or submission.
+            fallback_start = feature_data_cutoff - pd.Timedelta(days=CONTEXT_FALLBACK_DAYS)
+            fallback_context = historic_context[
+                historic_context["observed_at"] >= fallback_start
+            ]
+            for feature in context_features:
+                values = pd.to_numeric(fallback_context[feature], errors="coerce").dropna()
+                context_values[feature] = safe_float(values.median(), 0.0) if not values.empty else 0.0
+            age_text = f"{age_minutes:.0f} min" if not complete_context.empty else "sin registro completo"
             print(
-                f"Advertencia: sin contexto completo para {station_id} hasta "
-                f"{feature_data_cutoff}; las variables de contexto usarán 0."
+                f"Contexto {station_id} obsoleto ({age_text}); uso medianas de "
+                f"hasta {CONTEXT_FALLBACK_DAYS} días. La inferencia continúa."
             )
     if history.empty:
         raise RuntimeError(
@@ -221,7 +236,7 @@ def _feature_row_for_target(
                 row[feature] = float(np.cos(2 * np.pi * target_at.dayofweek / 7))
             continue
         if feature in {"rain_forecast", "temperature_forecast", "event_intensity"}:
-            row[feature] = safe_float(available_context.get(feature), 0.0)
+            row[feature] = context_values.get(feature, 0.0)
             continue
         if feature in {"is_weekend", "quarter_sin", "quarter_cos", "weekday_sin", "weekday_cos"}:
             day_of_week = data_cutoff.dayofweek
