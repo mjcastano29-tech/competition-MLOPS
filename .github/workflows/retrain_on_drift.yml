@@ -2,6 +2,12 @@ name: retrain-on-wape-drift
 
 on:
   workflow_dispatch:
+    inputs:
+      force_candidate:
+        description: Train a candidate from persisted Supabase data without requiring a pending WAPE alert
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: pulso-model-retrain
@@ -52,17 +58,22 @@ jobs:
             [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || available=false
           done
           echo "available=$available" >> "$GITHUB_OUTPUT"
+      - name: Require current champion for a manual candidate run
+        if: inputs.force_candidate == true && steps.model_state.outputs.available != 'true'
+        run: |
+          echo "No se encontró el champion actual; se cancela para evitar activar un candidato sin comparación." >&2
+          exit 1
       - name: Download current collected data from Supabase
-        if: steps.pending.outputs.drift_pending == 'true'
+        if: steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true
         run: python scripts/download_supabase_data.py
       - name: Preserve prior package
-        if: steps.pending.outputs.drift_pending == 'true' && steps.model_state.outputs.available == 'true'
+        if: (steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true) && steps.model_state.outputs.available == 'true'
         run: |
           cp -a artifacts/pulso_transmi_best_models artifacts/previous_model
           if [[ -f artifacts/pulso_transmi_best_models.zip ]]; then cp artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip; fi
       - name: Train candidate using temporal validation accuracy
         id: train
-        if: steps.pending.outputs.drift_pending == 'true'
+        if: steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true
         run: |
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/03_gradient_boosting.py
           MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/04_package_best_model.py
@@ -76,7 +87,7 @@ jobs:
             --package-zip artifacts/pulso_transmi_best_models.zip \
             --output artifacts/model_promotion.json
       - name: Save promoted model package
-        if: steps.train.outcome == 'success'
+        if: steps.train.outcome == 'success' && steps.model_state.outputs.available == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -94,7 +105,13 @@ jobs:
           DRIFT_CHECK_ID: ${{ steps.pending.outputs.drift_check_id }}
         run: |
           if [[ "$DRIFT_PENDING" != "true" ]]; then
-            echo "Sin alertas WAPE pendientes; no se reentrenó." >> "$GITHUB_STEP_SUMMARY"
+            if [[ "${{ inputs.force_candidate }}" == "true" && "$TRAIN_OUTCOME" == "success" ]]; then
+              echo "Candidato manual entrenado y evaluado contra el champion; solo se guarda si supera la compuerta de calidad." >> "$GITHUB_STEP_SUMMARY"
+            elif [[ "${{ inputs.force_candidate }}" == "true" ]]; then
+              echo "El entrenamiento manual del candidato no terminó; el champion se conserva." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Sin alertas WAPE pendientes; no se reentrenó." >> "$GITHUB_STEP_SUMMARY"
+            fi
           elif [[ "$TRAIN_OUTCOME" == "success" ]]; then
             echo "Candidato entrenado y evaluado. Alerta WAPE procesada: $DRIFT_CHECK_ID." >> "$GITHUB_STEP_SUMMARY"
           else
