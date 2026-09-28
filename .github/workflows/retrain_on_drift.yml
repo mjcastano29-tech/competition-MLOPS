@@ -148,7 +148,7 @@ jobs:
             artifacts/pulso_transmi_best_models.zip
           key: pulso-transmi-model-gap133-${{ github.run_id }}
       - name: Publish the champion package for the next run
-        if: steps.promote.outcome == 'success' && (steps.model_state.outputs.available == 'true' || steps.promote.outputs.promoted == 'true')
+        if: steps.model_state.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: champion-package
