@@ -12,6 +12,19 @@ import httpx
 DEFAULT_API_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
 
 
+def normalize_station_id(value: object) -> str:
+    station_id = str(value).strip()
+    if station_id.isdigit():
+        return station_id.zfill(5)
+    return station_id
+
+
+def normalize_target_key(value: object) -> str:
+    if isinstance(value, str):
+        return value.replace("Z", "+00:00")
+    return str(value)
+
+
 class SubmissionError(RuntimeError):
     pass
 
@@ -66,8 +79,14 @@ def validate_payload(payload: dict[str, Any], cycle: dict[str, Any]) -> None:
     if payload["data_cutoff"] != cycle["data_cutoff"]:
         raise SubmissionError("data_cutoff debe coincidir exactamente con el ciclo actual.")
 
-    expected = {(target["station_id"], target["target_at"]) for target in cycle["targets"]}
-    received = {(prediction.get("station_id"), prediction.get("target_at")) for prediction in payload["predictions"]}
+    expected = {
+        (normalize_station_id(target["station_id"]), normalize_target_key(target["target_at"]))
+        for target in cycle["targets"]
+    }
+    received = {
+        (normalize_station_id(prediction.get("station_id")), normalize_target_key(prediction.get("target_at")))
+        for prediction in payload["predictions"]
+    }
     if len(payload["predictions"]) != cycle["expected_predictions"]:
         raise SubmissionError(
             f"Se esperaban {cycle['expected_predictions']} predicciones, pero llegaron {len(payload['predictions'])}."
