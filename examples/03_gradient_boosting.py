@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import json
 import pickle
-from datetime import timedelta
+import subprocess
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -25,6 +29,13 @@ EXPECTED_STATION_COUNT = 12
 RECENCY_HALF_LIFE_DAYS = 14.0
 MLFLOW_EXPERIMENT = "pulso-transmi-forecasting"
 BEST_MODEL_DIR = Path("artifacts/models")
+# Validation is a fixed absolute window, not "the last 21 days of whatever is
+# on disk", so a candidate and the champion can be scored on identical folds.
+HOLDOUT_DAYS = 21
+VALIDATION_FOLD_DAYS = 7
+SNAPSHOT_POINTER = Path("data/snapshot.json")
+VALIDATION_WINDOW_REPORT = Path("reports/validation_window.json")
+
 MODEL_CONFIGS = {
     "HGB baseline": {
         "learning_rate": 0.05,
@@ -203,6 +214,149 @@ def accuracy_by_station(frame: pd.DataFrame) -> pd.Series:
     ).clip(lower=0)
 
 
+def git_commit() -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+
+def load_dataset_frames(
+    snapshot_pointer: Path = SNAPSHOT_POINTER,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Carga el snapshot versionado cuando existe; si no, los CSV sueltos de `data/`.
+
+    El manifiesto del snapshot se devuelve tal cual para que cada fila de metrica
+    quede ligada al hash de filas y al `dataset_id` exactos del entrenamiento.
+    """
+
+    try:
+        from scripts.snapshot_dataset import load_snapshot_manifest
+    except ImportError:  # ejecutado como `python examples/03_gradient_boosting.py`
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts.snapshot_dataset import load_snapshot_manifest
+
+    manifest = load_snapshot_manifest(snapshot_pointer)
+    if manifest:
+        observations = pd.read_csv(
+            manifest["observations"], dtype={"station_id": "string"}, parse_dates=["observed_at"]
+        )
+        context = pd.read_csv(manifest["context"], parse_dates=["observed_at"])
+        print(
+            f"Entrenando sobre snapshot {manifest['dataset_name']} "
+            f"(hash {str(manifest['rows_hash'])[:12]}, {manifest['row_count']} filas)."
+        )
+        return observations, context, manifest
+    observations = pd.read_csv("data/observations.csv", dtype={"station_id": "string"}, parse_dates=["observed_at"])
+    context = pd.read_csv("data/context.csv", parse_dates=["observed_at"])
+    print(
+        "Aviso: no hay data/snapshot.json; se entrena sobre data/*.csv y las metricas "
+        "quedan sin dataset_id ni hash de filas."
+    )
+    return observations, context, {}
+
+
+def resolve_fold_starts(
+    frame: pd.DataFrame,
+    validation_anchor: str | datetime | None = None,
+    *,
+    holdout_days: int = HOLDOUT_DAYS,
+    fold_days: int = VALIDATION_FOLD_DAYS,
+) -> tuple[pd.Timestamp, list[pd.Timestamp]]:
+    """Ventanas de validacion absolutas y comparables entre modelos.
+
+    Sin ancla se conserva el comportamiento historico (ultimos `holdout_days` dias).
+    Con ancla —el `validation_start` del campeon— las folds se repiten exactas, que
+    es lo unico que hace valida una comparacion de promocion.
+    """
+
+    if holdout_days <= 0 or holdout_days % fold_days:
+        raise ValueError("holdout_days debe ser positivo y multiplo de fold_days.")
+    latest = frame["observed_at"].max() - timedelta(minutes=max(HORIZONS) * 15)
+    if validation_anchor is None:
+        anchor = latest - timedelta(days=holdout_days)
+    else:
+        anchor = pd.Timestamp(validation_anchor)
+        anchor = anchor.tz_localize("UTC") if anchor.tzinfo is None else anchor.tz_convert("UTC")
+    fold_starts = [
+        anchor + timedelta(days=fold_days * index) for index in range(holdout_days // fold_days)
+    ]
+    if fold_starts[0] <= frame["observed_at"].min():
+        raise ValueError(
+            f"La ventana anclada {fold_starts[0]} no deja historial para entrenar "
+            f"(primera fila util {frame['observed_at'].min()})."
+        )
+    if fold_starts[-1] > latest:
+        raise ValueError(
+            f"La ventana anclada {fold_starts[-1]} esta mas alla del ultimo dato util {latest}."
+        )
+    return anchor, fold_starts
+
+
+def load_champion_bundle(
+    bundle_dir: Path,
+) -> tuple[dict[int, tuple[Any, dict[str, Any]]], dict[str, Any]]:
+    """Lee `models/*.pkl` + `configs/*_ensemble.json` del paquete del campeon."""
+
+    root = Path(bundle_dir)
+    manifest_path = root / "manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    )
+    bundle: dict[int, tuple[Any, dict[str, Any]]] = {}
+    for config_dir in (root / "configs", root):
+        for config_path in sorted(config_dir.glob("horizon_*_ensemble.json")):
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            horizon_minutes = int(config["horizon_minutes"])
+            if horizon_minutes in bundle:
+                continue
+            model_path = root / "models" / f"horizon_{horizon_minutes}_hgb.pkl"
+            if not model_path.exists():
+                model_path = root / f"horizon_{horizon_minutes}_hgb.pkl"
+            if not model_path.exists():
+                continue
+            with model_path.open("rb") as stream:
+                bundle[horizon_minutes] = (pickle.load(stream), config)
+        if bundle:
+            break
+    if not bundle:
+        raise ValueError(
+            f"No hay modelos del campeon en {root}; esperaba models/horizon_*_hgb.pkl."
+        )
+    return bundle, manifest
+
+
+def champion_rows_for_horizon(
+    bundle: dict[int, tuple[Any, dict[str, Any]]],
+    label: str,
+    fold: int,
+    horizon: int,
+    validation: pd.DataFrame,
+) -> list[dict[str, object]]:
+    """Puntua al campeon sobre la MISMA fold del candidato: comparacion emparejada."""
+
+    model, config = bundle[horizon * 15]
+    feature_columns = list(config["feature_columns"])
+    missing = [column for column in feature_columns if column not in validation.columns]
+    if missing:
+        raise KeyError(
+            f"El campeon exige {len(missing)} columnas ausentes ({missing[:5]}...): cambio el "
+            "protocolo de features y la comparacion deja de ser valida."
+        )
+    hgb_weight = float(config["hgb_weight"])
+    baseline_lag = int(config.get("baseline_lag", 672 - horizon))
+    weekly_baseline = validation[f"demand_lag_{baseline_lag}"].to_numpy()
+    # El DataFrame se pasa con el orden exacto del fit: scikit-learn valida nombres
+    # y orden de columnas antes de predecir.
+    predictions = hgb_weight * model.predict(validation.loc[:, feature_columns]) + (
+        1 - hgb_weight
+    ) * weekly_baseline
+    return score(label, fold, horizon, validation, pd.Series(predictions))
+
+
+
 def score(
     name: str,
     fold: int,
@@ -216,13 +370,17 @@ def score(
     station_count = scored["station_id"].nunique()
     if station_count != EXPECTED_STATION_COUNT:
         raise ValueError(
-            f"Se esperaban {EXPECTED_STATION_COUNT} estaciones, pero la predicción contiene {station_count}."
+            f"Se esperaban {EXPECTED_STATION_COUNT} estaciones, pero la predicción "
+            f"contiene {station_count}."
         )
     station_scores = accuracy_by_station(scored)
     rows = []
     for station_id, accuracy in station_scores.items():
         station_frame = scored.loc[scored["station_id"] == station_id]
-        wape = (station_frame[TARGET] - station_frame["prediction"]).abs().sum() / station_frame[TARGET].sum()
+        wape = (
+            (station_frame[TARGET] - station_frame["prediction"]).abs().sum()
+            / station_frame[TARGET].sum()
+        )
         rows.append(
             {
                 "fold": fold,
@@ -337,29 +495,66 @@ def save_best_models(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Validacion temporal multiorizonte con comparacion emparejada."
+    )
+    parser.add_argument(
+        "--validation-anchor",
+        help="validation_start absoluto (ISO). Sin el, se usan los ultimos HOLDOUT_DAYS dias.",
+    )
+    parser.add_argument("--holdout-days", type=int, default=HOLDOUT_DAYS)
+    parser.add_argument(
+        "--score-champion",
+        type=Path,
+        help="Directorio del bundle del campeon, para puntuarlo en las mismas folds.",
+    )
+    parser.add_argument("--champion-version", help="Version del campeon a rotular en las metricas.")
+    args = parser.parse_args()
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
     with mlflow.start_run(run_name="rolling-multihorizon-validation") as parent_run:
-        run_experiment(parent_run.info.run_id)
+        run_experiment(
+            parent_run.info.run_id,
+            validation_anchor=args.validation_anchor,
+            holdout_days=args.holdout_days,
+            champion_dir=args.score_champion,
+            champion_version=args.champion_version,
+        )
 
 
-def run_experiment(parent_run_id: str) -> None:
-    observations = pd.read_csv(
-        "data/observations.csv",
-        dtype={"station_id": "string"},
-        parse_dates=["observed_at"],
-    )
-    context = pd.read_csv("data/context.csv", parse_dates=["observed_at"])
+def run_experiment(
+    parent_run_id: str,
+    *,
+    validation_anchor: str | None = None,
+    holdout_days: int = HOLDOUT_DAYS,
+    champion_dir: Path | None = None,
+    champion_version: str | None = None,
+) -> None:
+    observations, context, snapshot = load_dataset_frames()
     frame = add_features(observations, context)
 
     feature_columns = [
         column for column in frame.columns if column not in {"observed_at", TARGET, "station_id"}
     ]
-    latest_timestamp = frame["observed_at"].max() - timedelta(minutes=max(HORIZONS) * 15)
-    fold_starts = [
-        latest_timestamp - timedelta(days=21),
-        latest_timestamp - timedelta(days=14),
-        latest_timestamp - timedelta(days=7),
-    ]
+    anchor, fold_starts = resolve_fold_starts(
+        frame, validation_anchor, holdout_days=holdout_days
+    )
+    fold_windows = {
+        fold: (start, start + timedelta(days=VALIDATION_FOLD_DAYS))
+        for fold, start in enumerate(fold_starts, start=1)
+    }
+    champion_bundle: dict[int, tuple[Any, dict[str, Any]]] | None = None
+    champion_label: str | None = None
+    if champion_dir is not None:
+        champion_bundle, champion_manifest = load_champion_bundle(champion_dir)
+        champion_version = (
+            champion_version or champion_manifest.get("model_version") or "desconocida"
+        )
+        champion_label = f"Champion {champion_version}"
+    print(
+        f"Validacion anclada en {anchor} -> {fold_windows[len(fold_starts)][1]} "
+        f"({len(fold_starts)} folds de {VALIDATION_FOLD_DAYS} dias); "
+        f"campeon: {champion_label or 'sin emparejar'}."
+    )
     metric_rows: list[dict[str, object]] = []
 
     for horizon in HORIZONS:
@@ -368,7 +563,7 @@ def run_experiment(parent_run_id: str) -> None:
         horizon_frame = horizon_frame.dropna(subset=["target"])
         horizon_feature_columns = feature_columns_for_horizon(feature_columns, horizon * 15)
         for fold, validation_start in enumerate(fold_starts, start=1):
-            validation_end = validation_start + timedelta(days=7)
+            validation_end = validation_start + timedelta(days=VALIDATION_FOLD_DAYS)
             # Leave a horizon-sized embargo so training labels cannot overlap validation.
             train_cutoff = validation_start - timedelta(minutes=(horizon + 1) * 15)
             train = horizon_frame.loc[horizon_frame["observed_at"] <= train_cutoff].copy()
@@ -376,6 +571,12 @@ def run_experiment(parent_run_id: str) -> None:
                 (horizon_frame["observed_at"] >= validation_start)
                 & (horizon_frame["observed_at"] < validation_end)
             ].copy()
+            if train.empty or validation.empty:
+                raise ValueError(
+                    f"Fold {fold} del horizonte {horizon * 15} quedo vacia "
+                    f"(entrenamiento={len(train)}, validacion={len(validation)}); la ventana "
+                    "anclada no corresponde a los datos del snapshot."
+                )
             print(
                 f"Horizonte {horizon * 15} min, fold {fold}: "
                 f"entrenamiento={len(train)}; validación={len(validation)}"
@@ -408,6 +609,21 @@ def run_experiment(parent_run_id: str) -> None:
                 nested=True,
             ):
                 log_evaluation(baseline_rows, horizon, fold, len(train), len(validation))
+
+            if champion_bundle is not None and horizon * 15 in champion_bundle:
+                # El campeon se evalua sobre estas mismas filas: el delta deja de
+                # ser "dos epocas distintas" y pasa a ser una comparacion emparejada.
+                incumbent_rows = champion_rows_for_horizon(
+                    champion_bundle, str(champion_label), fold, horizon, validation
+                )
+                metric_rows.extend(incumbent_rows)
+                with mlflow.start_run(
+                    run_name=f"champion-{champion_version}-h{horizon * 15}-fold{fold}",
+                    nested=True,
+                ):
+                    log_evaluation(incumbent_rows, horizon, fold, len(train), len(validation))
+                    mlflow.set_tag("model_role", "incumbent_scored_on_candidate_window")
+                    mlflow.set_tag("champion_version", str(champion_version))
 
             hgb_predictions: dict[str, pd.Series] = {}
             for model_name, model_config in MODEL_CONFIGS.items():
@@ -464,9 +680,53 @@ def run_experiment(parent_run_id: str) -> None:
                         mlflow.set_tag("ensemble", "HistGradientBoosting + Seasonal Naive 7d")
 
     metrics = pd.DataFrame(metric_rows)
+    # `validation_start/end` es la VENTANA COMPLETA de evaluacion (la union de
+    # folds), identica para candidato y campeon: es la clave con la que
+    # scripts/model_gate.py verifica que ambas metricas son comparables. El detalle
+    # por fold se conserva en `fold_start/fold_end`.
+    window_start = anchor
+    window_end = fold_windows[len(fold_starts)][1]
+    metrics["validation_start"] = window_start
+    metrics["validation_end"] = window_end
+    metrics["fold_start"] = metrics["fold"].map(
+        {fold: window[0] for fold, window in fold_windows.items()}
+    )
+    metrics["fold_end"] = metrics["fold"].map(
+        {fold: window[1] for fold, window in fold_windows.items()}
+    )
+    metrics["history_gap_steps"] = TRAINING_HISTORY_GAP_STEPS
+    metrics["dataset_name"] = snapshot.get("dataset_name", "")
+    metrics["dataset_id"] = snapshot.get("dataset_id") or ""
+    metrics["dataset_rows_hash"] = snapshot.get("rows_hash") or ""
+    metrics["git_commit"] = git_commit() or ""
+    window_report = {
+        "validation_start": anchor.isoformat(),
+        "validation_end": fold_windows[len(fold_starts)][1].isoformat(),
+        "folds": [
+            {"fold": fold, "start": window[0].isoformat(), "end": window[1].isoformat()}
+            for fold, window in sorted(fold_windows.items())
+        ],
+        "holdout_days": holdout_days,
+        "fold_days": VALIDATION_FOLD_DAYS,
+        "history_gap_steps": TRAINING_HISTORY_GAP_STEPS,
+        "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
+        "dataset_name": snapshot.get("dataset_name"),
+        "dataset_id": snapshot.get("dataset_id"),
+        "dataset_rows_hash": snapshot.get("rows_hash"),
+        "dataset_cutoff_at": snapshot.get("cutoff_at"),
+        "git_commit": git_commit(),
+        "champion_version": champion_version,
+        "champion_scored": champion_bundle is not None,
+        "mlflow_run_id": parent_run_id,
+    }
     report_path = Path("reports/ml_validation_metrics.csv")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     metrics.to_csv(report_path, index=False)
+    VALIDATION_WINDOW_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    VALIDATION_WINDOW_REPORT.write_text(
+        json.dumps(window_report, indent=2) + "\n", encoding="utf-8"
+    )
+    mlflow.log_artifact(str(VALIDATION_WINDOW_REPORT), artifact_path="validation")
     mlflow.log_artifact(str(report_path), artifact_path="validation")
     ensemble_metrics = metrics[metrics["model"].str.startswith("Ensemble ")]
     ensemble_summary = (

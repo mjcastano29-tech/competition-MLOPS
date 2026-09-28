@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+      # Permite recuperar el ultimo paquete promoted cuando el cache del runner llega vacio.
+      actions: read
     env:
       PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
@@ -47,6 +49,31 @@ jobs:
           restore-keys: |
             pulso-transmi-model-gap133-
             pulso-transmi-model-
+      - name: Recover champion package from the last successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bundle=artifacts/pulso_transmi_best_models
+          complete=true
+          [[ -f "$bundle/best_ensemble_summary.csv" ]] || complete=false
+          for horizon in 15 30 45 60; do
+            [[ -f "$bundle/models/horizon_${horizon}_hgb.pkl" ]] || complete=false
+            [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || complete=false
+          done
+          if [[ "$complete" == true ]]; then
+            echo "Champion recuperado del cache; no hace falta el artefacto."
+            exit 0
+          fi
+          run_id=$(gh run list --workflow retrain_on_drift.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then
+            echo "No hay ningun run previo del que recuperar el champion: este run tendria que arrancar el primer modelo."
+            exit 0
+          fi
+          if gh run download "$run_id" -n champion-package --dir artifacts; then
+            echo "Champion recuperado del artefacto del run $run_id (el cache del runner llegaba vacio)."
+          else
+            echo "El run $run_id no dejo el artefacto champion-package: no habra comparacion emparejada."
+          fi
       - name: Check restored package
         id: model_state
         run: |
@@ -58,6 +85,12 @@ jobs:
             [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || available=false
           done
           echo "available=$available" >> "$GITHUB_OUTPUT"
+          # Sin campeon no hay nada que emparejar: la unica promocion posible es arrancar.
+          if [[ "$available" == true ]]; then
+            echo "first_model=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "first_model=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Require current champion for a manual candidate run
         if: inputs.force_candidate == true && steps.model_state.outputs.available != 'true'
         run: |
@@ -75,35 +108,84 @@ jobs:
         id: train
         if: steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true
         run: |
-          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/03_gradient_boosting.py
-          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/04_package_best_model.py
+          champion_args=()
+          if [[ "${{ steps.model_state.outputs.available }}" == 'true' ]]; then
+            champion_args+=(--score-champion artifacts/previous_model)
+            champion_version=$(python -c "import json,pathlib,sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text()).get('model_version') or '')" artifacts/previous_model/manifest.json 2>/dev/null || true)
+            if [[ -n "$champion_version" ]]; then
+              champion_args+=(--champion-version "$champion_version")
+            fi
+          fi
+          echo "El candidato se evalua en la misma ventana y folds que el champion: ${champion_args[*]:-sin champion}"
+          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/03_gradient_boosting.py "${champion_args[@]}"
+          MLFLOW_DISABLE_AGENT_HINT=1 PYTHONWARNINGS=ignore PYTHONPATH=src python examples/04_package_best_model.py \
+            --previous-model artifacts/previous_model
       - name: Promote candidate only if validation accuracy improves
-        if: steps.train.outcome == 'success' && steps.model_state.outputs.available == 'true'
+        id: promote
+        if: steps.train.outcome == 'success'
         run: |
+          previous_args=()
+          if [[ -n "$(ls -A artifacts/previous_model 2>/dev/null)" ]]; then
+            previous_args+=(--previous artifacts/previous_model)
+          else
+            # Sin esta bandera, cuando el cache llega vacio la compuerta se salta y el
+            # campeon de produccion se queda obsoleto para siempre sin nadie que avise.
+            echo "::warning::No hay paquete previo que emparejar; se intenta el arranque del primer campeon."
+            previous_args+=(--first-model)
+          fi
           PYTHONPATH=src python scripts/promote_model.py \
             --candidate artifacts/pulso_transmi_best_models \
-            --previous artifacts/previous_model \
+            "${previous_args[@]}" \
             --package artifacts/pulso_transmi_best_models \
             --package-zip artifacts/pulso_transmi_best_models.zip \
             --output artifacts/model_promotion.json
       - name: Save promoted model package
-        if: steps.train.outcome == 'success' && steps.model_state.outputs.available == 'true'
+        if: steps.promote.outcome == 'success' && (steps.model_state.outputs.available == 'true' || steps.promote.outputs.promoted == 'true')
         uses: actions/cache/save@v4
         with:
           path: |
             artifacts/pulso_transmi_best_models
             artifacts/pulso_transmi_best_models.zip
           key: pulso-transmi-model-gap133-${{ github.run_id }}
+      - name: Publish the champion package for the next run
+        if: steps.promote.outcome == 'success' && (steps.model_state.outputs.available == 'true' || steps.promote.outputs.promoted == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: champion-package
+          path: artifacts/pulso_transmi_best_models
+          retention-days: 90
+          if-no-files-found: error
       - name: Mark drift alert processed
         if: steps.train.outcome == 'success' && steps.pending.outputs.drift_pending == 'true'
-        run: python scripts/wape_drift.py mark --id "${{ steps.pending.outputs.drift_check_id }}"
+        env:
+          PROMOTED: ${{ steps.promote.outputs.promoted }}
+          REASON: ${{ steps.promote.outputs.reason }}
+          DRIFT_CHECK_ID: ${{ steps.pending.outputs.drift_check_id }}
+        run: |
+          # La alerta solo se cierra cuando hubo veredicto medible. Un candidato que no
+          # se pudo emparejar (champion no recuperado, ventana distinta, metricas
+          # ausentes) deja la alerta viva para reintentarla en el siguiente ciclo.
+          case "$REASON" in
+            paired_improvement|first_model|no_improvement|horizon_regression|station_regression)
+              python scripts/wape_drift.py mark --id "$DRIFT_CHECK_ID"
+              echo "Alerta WAPE cerrada tras veredicto: $REASON (promovido=$PROMOTED)."
+              ;;
+            *)
+              echo "::warning::La alerta WAPE sigue pendiente: el candidato no dio un veredicto valido (reason=${REASON:-sin paso de promocion})."
+              ;;
+          esac
       - name: Report outcome
         if: always()
         env:
           DRIFT_PENDING: ${{ steps.pending.outputs.drift_pending }}
           TRAIN_OUTCOME: ${{ steps.train.outcome }}
           DRIFT_CHECK_ID: ${{ steps.pending.outputs.drift_check_id }}
+          PROMOTED: ${{ steps.promote.outputs.promoted }}
+          PROMOTION_REASON: ${{ steps.promote.outputs.reason }}
         run: |
+          if [[ -n "${PROMOTION_REASON:-}" ]]; then
+            echo "Decision de promocion: $PROMOTION_REASON (promovido=${PROMOTED:-no}). Los horizontes conservados del campeon quedan en artifacts/model_promotion.json." >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [[ "$DRIFT_PENDING" != "true" ]]; then
             if [[ "${{ inputs.force_candidate }}" == "true" && "$TRAIN_OUTCOME" == "success" ]]; then
               echo "Candidato manual entrenado y evaluado contra el champion; solo se guarda si supera la compuerta de calidad." >> "$GITHUB_STEP_SUMMARY"
@@ -123,5 +205,7 @@ jobs:
           name: wape-retraining-report
           path: |
             reports/ml_validation_metrics.csv
+            reports/validation_window.json
             artifacts/model_promotion.json
+            artifacts/pulso_transmi_best_models/promotion_inputs.json
           if-no-files-found: ignore

@@ -11,7 +11,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 import numpy as np
@@ -30,6 +30,45 @@ SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
 }
+
+# Vocabulario de variables que esta inferencia sabe construir. Un paquete puede mezclar
+# horizontes de origenes distintos (el candidato conserva los horizontes que gana el
+# campeon) y cada horizonte trae su propia lista en su config: si una columna no esta
+# aqui, rellenarla con 0.0 daria predicciones malas sin ningun aviso.
+SUPPORTED_FEATURE_PREFIXES = (
+    "station_id_",
+    "demand_lag_",
+    "demand_mean_",
+    "demand_std_",
+    "target_is_weekend_",
+    "target_quarter_sin_",
+    "target_quarter_cos_",
+    "target_weekday_sin_",
+    "target_weekday_cos_",
+)
+SUPPORTED_FEATURE_NAMES = {
+    "rain_forecast",
+    "temperature_forecast",
+    "event_intensity",
+    "is_weekend",
+    "quarter_sin",
+    "quarter_cos",
+    "weekday_sin",
+    "weekday_cos",
+}
+
+
+def unsupported_feature_columns(columns: Iterable[str]) -> list[str]:
+    """Columnas que la inferencia no puede calcular para ningun horizonte."""
+
+    return sorted(
+        {
+            str(column)
+            for column in columns
+            if not str(column).startswith(SUPPORTED_FEATURE_PREFIXES)
+            and str(column) not in SUPPORTED_FEATURE_NAMES
+        }
+    )
 
 
 def request_headers(api_key: str, idempotency_key: str | None = None) -> dict[str, str]:
@@ -141,7 +180,20 @@ def _feature_row_for_target(
         (observations["station_id"] == station_id)
         & (observations["observed_at"] <= feature_data_cutoff)
     ].sort_values("observed_at").copy()
-    feature_columns = config.get("feature_columns", [])
+    feature_columns = list(config.get("feature_columns") or [])
+    if not feature_columns:
+        raise RuntimeError(
+            f"El config del horizonte {config.get('horizon_minutes', '?')} no declara "
+            "feature_columns; no se puede reconstruir su fila de variables."
+        )
+    unknown = unsupported_feature_columns(feature_columns)
+    if unknown:
+        raise RuntimeError(
+            f"El modelo de {config.get('horizon_minutes', '?')} min pide columnas que esta "
+            f"inferencia no sabe construir: {unknown}. Un paquete puede mezclar horizontes "
+            "de origenes distintos; ante una columna desconocida se prefiere no enviar a "
+            "mandar predicciones con ceros silenciosos."
+        )
     context_features = sorted(
         {"rain_forecast", "temperature_forecast", "event_intensity"}.intersection(feature_columns)
     )
@@ -252,7 +304,10 @@ def _feature_row_for_target(
             elif feature == "weekday_cos":
                 row[feature] = float(np.cos(2 * np.pi * day_of_week / 7))
             continue
-        row[feature] = 0.0
+        raise RuntimeError(
+            f"Feature {feature!r} no esta en el vocabulario construible de la inferencia; "
+            "rellenarla con 0.0 cambiaria la prediccion sin avisar."
+        )
 
     return row
 

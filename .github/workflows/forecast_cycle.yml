@@ -20,6 +20,9 @@ jobs:
     timeout-minutes: 8
     permissions:
       contents: read
+      # Permite recuperar el paquete del campeon publicado por el ultimo reentrenamiento
+      # cuando el cache del runner llega vacio; sin el, la entrega caeria al bundle viejo.
+      actions: read
     env:
       PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
@@ -52,6 +55,32 @@ jobs:
           restore-keys: |
             pulso-transmi-model-gap133-
             pulso-transmi-model-
+
+      - name: Recover the champion package of the last retraining run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bundle=artifacts/pulso_transmi_best_models
+          complete=true
+          [[ -f "$bundle/best_ensemble_summary.csv" ]] || complete=false
+          for horizon in 15 30 45 60; do
+            [[ -f "$bundle/models/horizon_${horizon}_hgb.pkl" ]] || complete=false
+            [[ -f "$bundle/configs/horizon_${horizon}_ensemble.json" ]] || complete=false
+          done
+          if [[ "$complete" == true ]]; then
+            echo "El cache traia el paquete del campeon completo."
+            exit 0
+          fi
+          run_id=$(gh run list --workflow retrain_on_drift.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then
+            echo "::warning::No hay reentrenamiento previo del que recuperar el campeon; se usara el bundle del repositorio."
+            exit 0
+          fi
+          if gh run download "$run_id" -n champion-package --dir artifacts; then
+            echo "Paquete del campeon recuperado del artefacto del run $run_id."
+          else
+            echo "::warning::El run $run_id no publico champion-package; se usara el bundle del repositorio."
+          fi
 
       - name: Check restored model package
         id: model_state
