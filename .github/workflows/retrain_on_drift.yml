@@ -1,6 +1,10 @@
 name: retrain-on-wape-drift
 
 on:
+  # El profesor cambia el patron por estacion en cuestion de dias: un candidato cada 6 h
+  # sigue el regimen actual. La compuerta emparejada decide si reemplaza al campeon.
+  schedule:
+    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
       force_candidate:
@@ -26,6 +30,8 @@ jobs:
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://jwlgxabibcticikhjhzf.supabase.co' }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # Los runs programados siempre entrenan un candidato; los manuales, si se marca la casilla.
+      FORCE_CANDIDATE: ${{ github.event_name == 'schedule' || inputs.force_candidate == true }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -92,21 +98,21 @@ jobs:
             echo "first_model=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Require current champion for a manual candidate run
-        if: inputs.force_candidate == true && steps.model_state.outputs.available != 'true'
+        if: env.FORCE_CANDIDATE == 'true' && steps.model_state.outputs.available != 'true'
         run: |
           echo "No se encontró el champion actual; se cancela para evitar activar un candidato sin comparación." >&2
           exit 1
       - name: Download current collected data from Supabase
-        if: steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true
+        if: steps.pending.outputs.drift_pending == 'true' || env.FORCE_CANDIDATE == 'true'
         run: python scripts/download_supabase_data.py
       - name: Preserve prior package
-        if: (steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true) && steps.model_state.outputs.available == 'true'
+        if: (steps.pending.outputs.drift_pending == 'true' || env.FORCE_CANDIDATE == 'true') && steps.model_state.outputs.available == 'true'
         run: |
           cp -a artifacts/pulso_transmi_best_models artifacts/previous_model
           if [[ -f artifacts/pulso_transmi_best_models.zip ]]; then cp artifacts/pulso_transmi_best_models.zip artifacts/previous_model.zip; fi
       - name: Train candidate using temporal validation accuracy
         id: train
-        if: steps.pending.outputs.drift_pending == 'true' || inputs.force_candidate == true
+        if: steps.pending.outputs.drift_pending == 'true' || env.FORCE_CANDIDATE == 'true'
         run: |
           champion_args=()
           if [[ "${{ steps.model_state.outputs.available }}" == 'true' ]]; then
@@ -187,9 +193,9 @@ jobs:
             echo "Decision de promocion: $PROMOTION_REASON (promovido=${PROMOTED:-no}). Los horizontes conservados del campeon quedan en artifacts/model_promotion.json." >> "$GITHUB_STEP_SUMMARY"
           fi
           if [[ "$DRIFT_PENDING" != "true" ]]; then
-            if [[ "${{ inputs.force_candidate }}" == "true" && "$TRAIN_OUTCOME" == "success" ]]; then
+            if [[ "$FORCE_CANDIDATE" == "true" && "$TRAIN_OUTCOME" == "success" ]]; then
               echo "Candidato manual entrenado y evaluado contra el champion; solo se guarda si supera la compuerta de calidad." >> "$GITHUB_STEP_SUMMARY"
-            elif [[ "${{ inputs.force_candidate }}" == "true" ]]; then
+            elif [[ "$FORCE_CANDIDATE" == "true" ]]; then
               echo "El entrenamiento manual del candidato no terminó; el champion se conserva." >> "$GITHUB_STEP_SUMMARY"
             else
               echo "Sin alertas WAPE pendientes; no se reentrenó." >> "$GITHUB_STEP_SUMMARY"
