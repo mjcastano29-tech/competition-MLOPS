@@ -65,6 +65,12 @@ HOLDOUT_DAYS = 21
 VALIDATION_FOLD_DAYS = 7
 SNAPSHOT_POINTER = Path("data/snapshot.json")
 VALIDATION_WINDOW_REPORT = Path("reports/validation_window.json")
+# Mezcla final con persistencia (la demanda del corte): con drift reacciona antes que el
+# arbol. El peso se elige por estacion en la fold anterior (walk-forward) y en estaciones
+# estables converge a 0, asi que ahi no cambia nada.
+PERSISTENCE_COLUMN = "visible_lag_0"
+PERSISTENCE_WEIGHT_GRID = tuple(round(0.05 * step, 2) for step in range(11))
+PERSISTENCE_WEIGHTS_REPORT = Path("reports/persistence_weights.json")
 
 MODEL_CONFIGS = {
     "HGB baseline": {
@@ -504,16 +510,117 @@ def load_champion_bundle(
     return bundle, manifest
 
 
+def choose_persistence_weights(
+    station_ids: np.ndarray,
+    target: np.ndarray,
+    base: np.ndarray,
+    persistence: np.ndarray,
+) -> dict[str, float]:
+    """Peso de persistencia por estacion que minimiza su WAPE en una fold ya observada.
+
+    Recorre `PERSISTENCE_WEIGHT_GRID` en orden y solo cambia ante una mejora estricta:
+    en empate gana el peso menor, que deja la prediccion del modelo intacta.
+    """
+
+    frame = pd.DataFrame(
+        {"station_id": station_ids, "target": target, "base": base, "persistence": persistence}
+    )
+    weights: dict[str, float] = {}
+    for station_id, block in frame.groupby("station_id", sort=True):
+        denominator = float(block["target"].sum())
+        best_weight, best_error = 0.0, float("inf")
+        for weight in PERSISTENCE_WEIGHT_GRID:
+            blended = np.clip(
+                (1 - weight) * block["base"].to_numpy() + weight * block["persistence"].to_numpy(),
+                0,
+                None,
+            )
+            error = float(np.abs(block["target"].to_numpy() - blended).sum())
+            if error < best_error - 1e-9:
+                best_weight, best_error = weight, error
+        weights[str(station_id)] = best_weight if denominator > 0 else 0.0
+    return weights
+
+
+def apply_persistence_weights(
+    base: np.ndarray,
+    persistence: np.ndarray,
+    station_ids: np.ndarray,
+    weights: dict[str, float] | None,
+) -> np.ndarray:
+    """`(1 - w) * base + w * persistencia` con el peso de cada estacion (0 si no esta)."""
+
+    if not weights:
+        return np.asarray(base, dtype=float)
+    station_weights = np.array(
+        [float(weights.get(str(station_id), 0.0)) for station_id in station_ids], dtype=float
+    )
+    return (1 - station_weights) * np.asarray(base, dtype=float) + station_weights * np.asarray(
+        persistence, dtype=float
+    )
+
+
+def champion_saw_fold(champion_manifest: dict[str, Any], validation_start: pd.Timestamp) -> bool:
+    """True si el campeon se entreno con datos de la fold (o no se sabe hasta cuando).
+
+    Puntuar su modelo congelado ahi seria medirlo dentro de la muestra: un campeon
+    entrenado hasta ayer "acierta" las tres folds de memoria y ningun candidato le gana.
+    """
+
+    training_end = champion_manifest.get("training_data_end")
+    if not training_end:
+        return True
+    end = pd.Timestamp(training_end)
+    end = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+    return end >= validation_start
+
+
+def refit_champion_recipe(
+    config: dict[str, Any],
+    champion_frame: pd.DataFrame,
+    horizon: int,
+    train_cutoff: pd.Timestamp,
+) -> Any | None:
+    """Reentrena la receta del campeon (modelo, columnas y hueco) con datos previos a la fold.
+
+    Es la misma regla que sigue el candidato, asi la comparacion mide receta contra receta
+    con la misma informacion. Devuelve `None` si la receta ya no existe en MODEL_CONFIGS.
+    """
+
+    model_config = MODEL_CONFIGS.get(str(config.get("hgb_model")))
+    if model_config is None:
+        return None
+    train = champion_frame.copy()
+    train["target"] = train.groupby("station_id", sort=False)[TARGET].shift(-horizon)
+    train = train.dropna(subset=["target"])
+    train = train.loc[train["observed_at"] <= train_cutoff]
+    model = HistGradientBoostingRegressor(**model_config, early_stopping=False, random_state=42)
+    model.fit(
+        train.loc[:, list(config["feature_columns"])],
+        train["target"],
+        sample_weight=station_balanced_weights(
+            train,
+            half_life_days=float(config.get("recency_half_life_days") or RECENCY_HALF_LIFE_DAYS),
+        ),
+    )
+    return model
+
+
 def champion_rows_for_horizon(
     bundle: dict[int, tuple[Any, dict[str, Any]]],
     label: str,
     fold: int,
     horizon: int,
     validation: pd.DataFrame,
+    model: Any | None = None,
 ) -> list[dict[str, object]]:
-    """Puntua al campeon sobre la MISMA fold del candidato: comparacion emparejada."""
+    """Puntua al campeon sobre la MISMA fold del candidato: comparacion emparejada.
 
-    model, config = bundle[horizon * 15]
+    `model` sustituye al modelo congelado cuando se puntua la receta reentrenada.
+    """
+
+    frozen_model, config = bundle[horizon * 15]
+    model = frozen_model if model is None else model
     feature_columns = list(config["feature_columns"])
     missing = [column for column in feature_columns if column not in validation.columns]
     if missing:
@@ -529,6 +636,13 @@ def champion_rows_for_horizon(
     predictions = hgb_weight * model.predict(validation.loc[:, feature_columns]) + (
         1 - hgb_weight
     ) * weekly_baseline
+    # Un campeon que ya mezcla persistencia se puntua con sus propios pesos.
+    predictions = apply_persistence_weights(
+        predictions,
+        validation[PERSISTENCE_COLUMN].to_numpy(),
+        validation["station_id"].to_numpy(),
+        config.get("persistence_weights"),
+    )
     return score(label, fold, horizon, validation, pd.Series(predictions))
 
 
@@ -636,6 +750,7 @@ def save_best_models(
     best_model_names: dict[int, str],
     ensemble_metrics: pd.DataFrame,
     parent_run_id: str,
+    persistence_weights: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> None:
     BEST_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     for horizon_minutes, ensemble_name in best_model_names.items():
@@ -671,6 +786,9 @@ def save_best_models(
                     "history_gap_steps": TRAINING_HISTORY_GAP_STEPS,
                     "feature_protocol": FEATURE_PROTOCOL,
                     "target_seasonal_days": list(TARGET_SEASONAL_DAYS),
+                    "persistence_weights": (persistence_weights or {})
+                    .get(str(horizon_minutes), {})
+                    .get(ensemble_name, {}),
                     "station_count": EXPECTED_STATION_COUNT,
                     "feature_columns": horizon_feature_columns,
                     "training_rows": len(horizon_frame),
@@ -755,6 +873,8 @@ def run_experiment(
     }
     champion_bundle: dict[int, tuple[Any, dict[str, Any]]] | None = None
     champion_label: str | None = None
+    champion_manifest: dict[str, Any] = {}
+    champion_scoring: set[str] = set()
     if champion_dir is not None:
         champion_bundle, champion_manifest = load_champion_bundle(champion_dir)
         champion_version = (
@@ -770,12 +890,18 @@ def run_experiment(
     # Frames de features por hueco: el del candidato y, si difiere, el del campeon.
     frames_by_gap: dict[int, pd.DataFrame] = {TRAINING_HISTORY_GAP_STEPS: frame}
     champion_gaps: set[int] = set()
+    # Pesos de persistencia de cada ensemble elegidos en la ultima fold: los que empaqueta
+    # 04_package_best_model.py para la inferencia.
+    persistence_weights: dict[str, dict[str, dict[str, float]]] = {}
 
     for horizon in HORIZONS:
         horizon_frame = frame.copy()
         horizon_frame["target"] = horizon_frame.groupby("station_id", sort=False)[TARGET].shift(-horizon)
         horizon_frame = horizon_frame.dropna(subset=["target"])
         horizon_feature_columns = feature_columns_for_horizon(feature_columns, horizon * 15)
+        # Pesos de persistencia de la fold anterior por ensemble; la primera fold va sin
+        # mezcla, porque elegirlos sobre la misma fold que se puntua seria hacer trampa.
+        previous_weights: dict[str, dict[str, float]] = {}
         for fold, validation_start in enumerate(fold_starts, start=1):
             validation_end = validation_start + timedelta(days=VALIDATION_FOLD_DAYS)
             # Leave a horizon-sized embargo so training labels cannot overlap validation.
@@ -833,12 +959,25 @@ def run_experiment(
                     frames_by_gap[champion_gap] = add_features(
                         observations, context, champion_gap
                     )
+                champion_config = champion_bundle[horizon * 15][1]
+                refit_model = None
+                if champion_saw_fold(champion_manifest, validation_start):
+                    refit_model = refit_champion_recipe(
+                        champion_config, frames_by_gap[champion_gap], horizon, train_cutoff
+                    )
+                    if refit_model is None:
+                        print(
+                            f"Aviso: la receta {champion_config.get('hgb_model')!r} del campeon ya "
+                            "no existe; se puntua su modelo congelado dentro de la muestra."
+                        )
+                champion_scoring.add("frozen" if refit_model is None else "refit")
                 incumbent_rows = champion_rows_for_horizon(
                     champion_bundle,
                     str(champion_label),
                     fold,
                     horizon,
                     align_champion_validation(frames_by_gap[champion_gap], validation, horizon),
+                    model=refit_model,
                 )
                 metric_rows.extend(incumbent_rows)
                 with mlflow.start_run(
@@ -879,12 +1018,27 @@ def run_experiment(
                     )
 
             weekly_baseline = validation[f"demand_lag_{672 - horizon}"].to_numpy()
+            persistence = validation[PERSISTENCE_COLUMN].to_numpy()
+            station_ids = validation["station_id"].to_numpy()
+            fold_weights: dict[str, dict[str, float]] = {}
             for model_name, predictions in hgb_predictions.items():
                 for hgb_weight in ENSEMBLE_WEIGHTS:
                     ensemble_name = f"Ensemble {model_name} + Seasonal Naive 7d ({hgb_weight:.1f})"
-                    ensemble_predictions = (
+                    base_predictions = (
                         hgb_weight * predictions.to_numpy()
                         + (1 - hgb_weight) * weekly_baseline
+                    )
+                    fold_weights[ensemble_name] = choose_persistence_weights(
+                        station_ids,
+                        validation["target"].to_numpy(),
+                        base_predictions,
+                        persistence,
+                    )
+                    ensemble_predictions = apply_persistence_weights(
+                        base_predictions,
+                        persistence,
+                        station_ids,
+                        previous_weights.get(ensemble_name),
                     )
                     ensemble_rows = score(
                         ensemble_name,
@@ -902,6 +1056,8 @@ def run_experiment(
                         mlflow.log_param("hgb_model", model_name)
                         mlflow.log_param("hgb_weight", hgb_weight)
                         mlflow.set_tag("ensemble", "HistGradientBoosting + Seasonal Naive 7d")
+            previous_weights = fold_weights
+        persistence_weights[str(horizon * 15)] = previous_weights
 
     metrics = pd.DataFrame(metric_rows)
     # `validation_start/end` es la VENTANA COMPLETA de evaluacion (la union de
@@ -923,6 +1079,11 @@ def run_experiment(
         # Un campeon que conservo horizontes viejos puede mezclar huecos; cada horizonte ya
         # se puntuo con el suyo, y la compuerta necesita un solo valor: el mas atrasado.
         metrics.loc[metrics["model"] == champion_label, "history_gap_steps"] = max(champion_gaps)
+        # "refit" solo si todas sus filas se midieron como receta: la compuerta relaja la
+        # ganancia minima nada mas cuando la comparacion es enteramente fuera de muestra.
+        metrics.loc[metrics["model"] == champion_label, "incumbent_scoring"] = (
+            "refit" if champion_scoring == {"refit"} else "frozen"
+        )
     metrics["dataset_name"] = snapshot.get("dataset_name", "")
     metrics["dataset_id"] = snapshot.get("dataset_id") or ""
     metrics["dataset_rows_hash"] = snapshot.get("rows_hash") or ""
@@ -956,6 +1117,10 @@ def run_experiment(
         json.dumps(window_report, indent=2) + "\n", encoding="utf-8"
     )
     mlflow.log_artifact(str(VALIDATION_WINDOW_REPORT), artifact_path="validation")
+    PERSISTENCE_WEIGHTS_REPORT.write_text(
+        json.dumps(persistence_weights, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    mlflow.log_artifact(str(PERSISTENCE_WEIGHTS_REPORT), artifact_path="validation")
     mlflow.log_artifact(str(report_path), artifact_path="validation")
     ensemble_metrics = metrics[metrics["model"].str.startswith("Ensemble ")]
     ensemble_summary = (
@@ -986,6 +1151,7 @@ def run_experiment(
         best_model_names,
         ensemble_metrics,
         parent_run_id,
+        persistence_weights,
     )
     summary = (
         metrics.groupby(["horizon_minutes", "model"], as_index=False)["accuracy"]

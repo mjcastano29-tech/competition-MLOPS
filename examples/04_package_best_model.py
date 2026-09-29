@@ -33,6 +33,7 @@ from scripts.model_gate import (  # noqa: E402
 
 REPORT_PATH = ROOT / "reports/ml_validation_metrics.csv"
 WINDOW_REPORT_PATH = ROOT / "reports/validation_window.json"
+PERSISTENCE_WEIGHTS_PATH = ROOT / "reports/persistence_weights.json"
 PACKAGE_DIR = ROOT / "artifacts/pulso_transmi_best_models"
 PACKAGE_PATH = ROOT / "artifacts/pulso_transmi_best_models.zip"
 PROMOTION_INPUTS_PATH = PACKAGE_DIR / "promotion_inputs.json"
@@ -276,6 +277,13 @@ def main() -> None:
         raise ValueError("El paquete no contiene métricas para las 12 estaciones.")
 
     window_report = load_window_report()
+    # Pesos de persistencia por estacion elegidos en la ultima fold de 03; sin reporte
+    # (metricas antiguas) el paquete queda sin mezcla, igual que antes.
+    persistence_weights = (
+        json.loads(PERSISTENCE_WEIGHTS_PATH.read_text(encoding="utf-8"))
+        if PERSISTENCE_WEIGHTS_PATH.exists()
+        else {}
+    )
     # Se entrena y empaqueta sobre el snapshot versionado (data/snapshot.json) para
     # que el hash de filas del manifiesto coincida con el de las metricas.
     observations, context, snapshot = module.load_dataset_frames()
@@ -334,6 +342,9 @@ def main() -> None:
                 "history_gap_steps": module.TRAINING_HISTORY_GAP_STEPS,
                 "feature_protocol": module.FEATURE_PROTOCOL,
                 "target_seasonal_days": list(module.TARGET_SEASONAL_DAYS),
+                "persistence_weights": persistence_weights.get(str(int(horizon_minutes)), {}).get(
+                    ensemble_name, {}
+                ),
                 "recency_half_life_days": module.RECENCY_HALF_LIFE_DAYS,
                 "validation_start": window_report.get("validation_start"),
                 "validation_end": window_report.get("validation_end"),

@@ -172,7 +172,7 @@ jobs:
           # se pudo emparejar (champion no recuperado, ventana distinta, metricas
           # ausentes) deja la alerta viva para reintentarla en el siguiente ciclo.
           case "$REASON" in
-            paired_improvement|first_model|no_improvement|horizon_regression|station_regression)
+            paired_improvement|paired_refresh|first_model|no_improvement|horizon_regression|station_regression)
               python scripts/wape_drift.py mark --id "$DRIFT_CHECK_ID"
               echo "Alerta WAPE cerrada tras veredicto: $REASON (promovido=$PROMOTED)."
               ;;

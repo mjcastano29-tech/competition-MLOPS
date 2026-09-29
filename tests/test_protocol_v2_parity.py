@@ -273,3 +273,72 @@ def test_con_hueco_cero_la_ultima_demanda_es_la_del_corte(module):
         "demand",
     ].iloc[0]
     assert row["target_lag_1d_15"] == pytest.approx(yesterday)
+
+
+def test_la_mezcla_con_persistencia_coincide_en_los_dos_mundos(module):
+    """El peso por estacion aplicado al enviar reproduce el que se valido al entrenar."""
+
+    from scripts.infer_and_submit import blend_with_persistence
+
+    observations = history_frame()
+    context = context_frame(observations, DAYS)
+    frame = module.add_features(observations.copy(), context.copy(), GAP_STEPS)
+    data_cutoff = frame["observed_at"].max()
+    weights = {STATIONS[0]: 0.35}
+    config = {"history_gap_steps": GAP_STEPS, "persistence_weights": weights}
+    rows = frame.loc[frame["observed_at"] == data_cutoff].sort_values("station_id")
+    base = np.array([120.0, 250.0])
+
+    training = module.apply_persistence_weights(
+        base,
+        rows[module.PERSISTENCE_COLUMN].to_numpy(),
+        rows["station_id"].to_numpy(),
+        weights,
+    )
+    inference = [
+        blend_with_persistence(value, station_id, data_cutoff, observations, config)
+        for value, station_id in zip(base, rows["station_id"])
+    ]
+
+    np.testing.assert_allclose(training, inference)
+    # La estacion sin peso queda intacta: la mezcla nunca toca lo que no se calibro.
+    assert inference[1] == base[1]
+
+
+def test_el_peso_de_persistencia_solo_sube_si_mejora(module):
+    stations = np.array(["A"] * 4 + ["B"] * 4)
+    target = np.array([10.0, 10.0, 10.0, 10.0, 50.0, 60.0, 70.0, 80.0])
+    base = np.array([10.0, 10.0, 10.0, 10.0, 40.0, 50.0, 60.0, 70.0])
+    persistence = np.array([30.0, 30.0, 30.0, 30.0, 50.0, 60.0, 70.0, 80.0])
+
+    weights = module.choose_persistence_weights(stations, target, base, persistence)
+
+    assert weights["A"] == 0.0  # el modelo ya acierta: la persistencia solo empeora
+    assert weights["B"] == max(module.PERSISTENCE_WEIGHT_GRID)
+
+
+def test_un_campeon_que_vio_la_fold_se_puntua_como_receta(module):
+    start = pd.Timestamp("2026-09-10 03:00", tz="UTC")
+
+    assert module.champion_saw_fold({"training_data_end": "2026-09-16T23:00:00+00:00"}, start)
+    assert not module.champion_saw_fold({"training_data_end": "2026-09-08T23:00:00+00:00"}, start)
+    # Sin fecha de corte no se puede probar que este fuera de muestra: se reentrena.
+    assert module.champion_saw_fold({}, start)
+
+
+def test_la_receta_del_campeon_solo_ve_datos_previos_al_corte(module):
+    observations = history_frame()
+    context = context_frame(observations, DAYS)
+    frame = module.add_features(observations.copy(), context.copy(), GAP_STEPS)
+    columns = module.feature_columns_for_horizon(candidate_columns(module, frame), 15)
+    config = {"hgb_model": "HGB shallow", "feature_columns": columns}
+    cutoff = frame["observed_at"].max() - pd.Timedelta(days=1)
+
+    model = module.refit_champion_recipe(config, frame, 1, cutoff)
+
+    assert model is not None
+    # 12 estaciones en produccion, 2 aqui: filas por estacion hasta el corte, sin el futuro.
+    expected_rows = int((frame["observed_at"] <= cutoff).sum())
+    assert model.n_features_in_ == len(columns)
+    assert expected_rows < len(frame)
+    assert module.refit_champion_recipe({**config, "hgb_model": "no existe"}, frame, 1, cutoff) is None

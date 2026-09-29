@@ -494,6 +494,35 @@ def refresh_observations_from_stream(client: httpx.Client, data_cutoff: pd.Times
     )
 
 
+def blend_with_persistence(
+    value: float,
+    station_id: str,
+    data_cutoff: pd.Timestamp,
+    observations: pd.DataFrame,
+    config: dict[str, Any],
+) -> float:
+    """Mezcla el ensemble con la demanda del corte usando el peso de la estacion.
+
+    Espejo de `apply_persistence_weights()` en 03_gradient_boosting.py: la persistencia
+    es `visible_lag_0`, la ultima demanda conocida en `data_cutoff - hueco`. Un config sin
+    `persistence_weights` (campeones anteriores) devuelve el valor intacto.
+    """
+
+    weight = float((config.get("persistence_weights") or {}).get(station_id, 0.0))
+    if weight <= 0.0:
+        return value
+    history_gap_steps = int(config.get("history_gap_steps", DEFAULT_HISTORY_GAP_STEPS))
+    lag_time = data_cutoff - pd.Timedelta(minutes=history_gap_steps * PERIOD_MINUTES)
+    history = observations[observations["station_id"] == station_id].sort_values("observed_at")
+    last_row = _last_known_row(history, lag_time)
+    if last_row is None or pd.isna(last_row.get("demand")):
+        raise RuntimeError(
+            f"Falta la demanda de persistencia para {station_id} hasta {lag_time}; "
+            "no se enviará una predicción con variables imputadas."
+        )
+    return (1 - weight) * value + weight * safe_float(last_row["demand"])
+
+
 def normalize_station_id(value: Any) -> str:
     station_id = str(value).strip()
     return station_id.zfill(5) if station_id.isdigit() else station_id
@@ -556,6 +585,7 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
         baseline_lag = int(config.get("baseline_lag", 672 - horizon_minutes // 15))
         seasonal_value = safe_float(feature_row.get(f"demand_lag_{baseline_lag}"), 0.0)
         value = hgb_weight * hgb_value + (1 - hgb_weight) * seasonal_value
+        value = blend_with_persistence(value, station_id, data_cutoff, observations, config)
         predictions.append({
             "station_id": station_id,
             "target_at": target["target_at"],

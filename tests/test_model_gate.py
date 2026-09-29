@@ -270,3 +270,43 @@ def test_candidato_con_historia_mas_atrasada_no_es_comparable():
 
     assert not decision.promote
     assert decision.decision == "incomparable"
+
+
+def test_campeon_reentrenado_como_receta_se_refresca_sin_ganancia_minima():
+    """Receta contra receta, un candidato igual de bueno y con datos nuevos debe entrar."""
+
+    from dataclasses import replace
+
+    incumbent = replace(make_evaluation(BASE_INCUMBENT), scoring="refit")
+    decision = evaluate_promotion(make_evaluation(BASE_INCUMBENT), incumbent)
+
+    assert decision.promote
+    assert decision.decision == "paired_refresh"
+
+
+def test_campeon_congelado_sigue_exigiendo_la_ganancia_minima():
+    from dataclasses import replace
+
+    incumbent = replace(make_evaluation(BASE_INCUMBENT), scoring="frozen")
+    decision = evaluate_promotion(make_evaluation(BASE_INCUMBENT), incumbent)
+
+    assert not decision.promote
+    assert decision.decision == "no_improvement"
+
+
+def test_el_refresco_no_salta_la_regresion_de_un_horizonte():
+    from dataclasses import replace
+
+    incumbent = replace(make_evaluation(BASE_INCUMBENT), scoring="refit")
+    worse_at_60 = {**BETTER, 60: BASE_INCUMBENT[60] - 1.0}
+    decision = evaluate_promotion(make_evaluation(worse_at_60), incumbent)
+
+    assert not decision.promote
+    assert decision.decision == "horizon_regression"
+
+
+def test_la_forma_de_puntuar_al_campeon_viaja_en_el_paquete():
+    frame = metrics_frame(BASE_INCUMBENT).assign(incumbent_scoring="refit")
+    restored = evaluation_from_dict(evaluation_to_dict(evaluation(frame, "campeon")))
+
+    assert restored.scoring == "refit"

@@ -48,6 +48,9 @@ class Evaluation:
     folds: int = 0
     rows: int = 0
     model_name: str | None = None
+    # "refit": el campeon se midio reentrenando su receta con datos previos a cada fold;
+    # "frozen": con su modelo tal cual (puede haber visto esas filas al entrenar).
+    scoring: str | None = None
 
     @property
     def horizons(self) -> tuple[int, ...]:
@@ -174,6 +177,11 @@ def evaluation_from_frame(
     if len(hashes) > 1:
         raise ValueError(f"Las metricas mezclan snapshots del dataset: {sorted(hashes)}")
 
+    scorings = {
+        str(value)
+        for value in selected.get("incumbent_scoring", pd.Series(dtype=object)).dropna().unique()
+    }
+
     accuracy_by_horizon: dict[int, float] = {}
     wape_by_horizon: dict[int, float] = {}
     for horizon_minutes, horizon_frame in selected.groupby("horizon_minutes"):
@@ -206,6 +214,7 @@ def evaluation_from_frame(
         folds=int(selected["fold"].nunique()) if "fold" in selected.columns else 1,
         rows=int(len(selected)),
         model_name=_model_name(selected, min(accuracy_by_horizon)),
+        scoring=next(iter(scorings)) if len(scorings) == 1 else ("frozen" if scorings else None),
     )
 
 
@@ -349,6 +358,25 @@ def evaluate_promotion(
             horizon_deltas=horizon_deltas,
         )
 
+    if incumbent.scoring == "refit" and accuracy_delta >= 0:
+        # Receta contra receta con la misma informacion: si la del candidato no es peor,
+        # su modelo gana por construccion, porque se entreno con datos mas nuevos que el
+        # campeon. Exigir +0.5 aqui congelaria al campeon mientras el drift avanza.
+        return PromotionDecision(
+            True,
+            "paired_refresh",
+            (
+                f"Campeon medido como receta reentrenada en la misma ventana "
+                f"{candidate.validation_start}..{candidate.validation_end}; hueco "
+                f"{incumbent.history_gap_steps} -> {candidate.history_gap_steps} pasos.",
+                f"Exactitud {incumbent.accuracy:.2f} -> {candidate.accuracy:.2f} "
+                f"({accuracy_delta:+.2f} pts) con datos de entrenamiento mas recientes.",
+            ),
+            accuracy_delta=accuracy_delta,
+            wape_delta=wape_delta,
+            horizon_deltas=horizon_deltas,
+        )
+
     if accuracy_delta <= min_accuracy_gain:
         return PromotionDecision(
             False,
@@ -410,6 +438,7 @@ def evaluation_to_dict(evaluation: Evaluation | None) -> dict[str, Any] | None:
         "station_count": evaluation.station_count,
         "folds": evaluation.folds,
         "rows": evaluation.rows,
+        "scoring": evaluation.scoring,
     }
 
 
@@ -445,6 +474,7 @@ def evaluation_from_dict(payload: dict[str, Any] | None) -> Evaluation | None:
         folds=int(payload.get("folds") or 0),
         rows=int(payload.get("rows") or 0),
         model_name=payload.get("model_name"),
+        scoring=payload.get("scoring"),
     )
 
 
