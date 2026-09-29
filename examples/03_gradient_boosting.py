@@ -17,16 +17,46 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 
 
 TARGET = "demand"
+PERIOD_MINUTES = 15
+PERIODS_PER_DAY = 96
+# Lags heredados. Con un hueco de 133 pasos, `shift(max(lag, 133))` convertía los 11
+# lags cortos (1, 2, 3, 4, 8, 12, 92..96) en 11 copias exactas de la última fila
+# visible: el modelo perdía toda la trayectoria reciente. Se siguen calculando porque
+# el campeón los necesita para la comparación emparejada (`champion_rows_for_horizon`)
+# y porque la baseline estacional se referencia a `demand_lag_{672 - horizon}`, pero
+# `model_feature_columns()` ya no los entrega al candidato.
 LAGS = (1, 2, 3, 4, 8, 12, 92, 93, 94, 95, 96, 668, 669, 670, 671, 672)
+RETIRED_FEATURE_PREFIXES = ("demand_lag_",)
+# Antigüedad, en pasos adicionales sobre la última fila visible, de la escalera de
+# recencia. `visible_lag_0` es la última demanda publicable; `visible_lag_96` es la
+# misma hora de ayer relativo a esa última fila. Todos caen dentro del hueco.
+VISIBLE_LAG_OFFSETS = (0, 1, 2, 3, 4, 6, 8, 12, 24, 48, 96)
+# Días antes del objetivo cuya demanda del mismo cuarto horario se usa como referencia
+# (hace falta 96*d - horizon >= hueco para que sea publicable). d=7 reproduce
+# exactamente la baseline estacional de 7 días que usa el ensemble.
+TARGET_SEASONAL_DAYS = (1, 2, 3, 4, 5, 6, 7)
+CONTEXT_FEATURES = ("rain_forecast", "temperature_forecast", "event_intensity")
+# Deben coincidir con MAX_CONTEXT_AGE_MINUTES / CONTEXT_FALLBACK_DAYS de
+# scripts/infer_and_submit.py: el contexto se imputa en entrenamiento igual que en
+# producción, o el modelo aprende un régimen de clima que al enviar nunca ve.
+MAX_CONTEXT_AGE_MINUTES = 60
+CONTEXT_FALLBACK_DAYS = 7
+FEATURE_PROTOCOL = "v3-fresh-stream"
 ROLLING_WINDOWS = (4, 16, 96)
 ROLLING_STD_WINDOWS = (4, 16)
 HORIZONS = (1, 2, 3, 4)
-# The official cycle cutoff is currently 133 fifteen-minute periods newer
-# than the latest public observation; train against that same information lag.
-TRAINING_HISTORY_GAP_STEPS = 133
+# `/v1/stream/observations` publica la demanda del propio `data_cutoff` en el mismo
+# tick en que abre el ciclo, y la inferencia la lee directo de la API: no hay hueco.
+# Los 133 pasos heredados median la distancia al dataset inicial, no al stream, y
+# dejaban al modelo ciego ~33 h justo cuando el profesor cambia el patron.
+TRAINING_HISTORY_GAP_STEPS = 0
+# Hueco con el que se entreno el paquete gap133 original cuando su config no lo declara.
+LEGACY_HISTORY_GAP_STEPS = 133
 ENSEMBLE_WEIGHTS = (0.85, 0.9, 0.95, 1.0)
 EXPECTED_STATION_COUNT = 12
-RECENCY_HALF_LIFE_DAYS = 14.0
+# El stream trae cambios de nivel por estacion en cuestion de dias: tres dias de vida
+# media pesan mas el regimen actual sin tirar la estacionalidad semanal.
+RECENCY_HALF_LIFE_DAYS = 3.0
 MLFLOW_EXPERIMENT = "pulso-transmi-forecasting"
 BEST_MODEL_DIR = Path("artifacts/models")
 # Validation is a fixed absolute window, not "the last 21 days of whatever is
@@ -90,6 +120,78 @@ MODEL_CONFIGS = {
 }
 
 
+def _context_window_median(ordered_context: pd.DataFrame, moments: pd.DatetimeIndex) -> np.ndarray:
+    """Mediana por feature del contexto publicado en la ventana previa de varios dias.
+
+    Es el mismo relleno que aplica la inferencia cuando el contexto esta viejo o no
+    existe: mediana hacia atras de `CONTEXT_FALLBACK_DAYS` y 0.0 si tampoco hay filas.
+    """
+
+    times = pd.to_datetime(ordered_context["observed_at"], utc=True).to_numpy(dtype="datetime64[ns]")
+    values = ordered_context.loc[:, list(CONTEXT_FEATURES)].to_numpy(dtype=float)
+    window = np.timedelta64(CONTEXT_FALLBACK_DAYS * 24 * 60, "m")
+    result = np.zeros((len(moments), len(CONTEXT_FEATURES)), dtype=float)
+    moments_ns = pd.DatetimeIndex(moments).to_numpy(dtype="datetime64[ns]")
+    for position, moment in enumerate(moments_ns):
+        start = int(np.searchsorted(times, moment - window, side="left"))
+        end = int(np.searchsorted(times, moment, side="right"))
+        block = values[start:end]
+        for column in range(block.shape[1]):
+            samples = block[:, column]
+            samples = samples[~np.isnan(samples)]
+            result[position, column] = float(np.median(samples)) if samples.size else 0.0
+    return result
+
+
+def _context_lookup(context: pd.DataFrame, available_times: pd.Series) -> pd.DataFrame:
+    """Contexto reconstruido con las reglas exactas de `scripts/infer_and_submit.py`.
+
+    (1) Vale la ultima fila de contexto completa anterior a `available_times` y solo
+    cuenta como fresca si tiene <= `MAX_CONTEXT_AGE_MINUTES` minutos; (2) si esta vieja
+    o no existe, se imputa la mediana de los ultimos `CONTEXT_FALLBACK_DAYS` dias. Con
+    el merge exacto anterior quedaba NaN y el `dropna()` final se llevaba por delante
+    cada fila del stream de la competencia (la API no publica contexto despues del
+    dataset inicial): el modelo nunca veia la demanda nueva y aprendia un regimen de
+    clima que al enviar nunca recibe. `context_is_fresh` deja que el arbol sepa cuando
+    esas tres columnas van en serio y cuando son el relleno.
+    """
+
+    times = pd.to_datetime(available_times, utc=True)
+    unique_times = pd.DatetimeIndex(pd.unique(times)).sort_values()
+    ordered = context.copy()
+    ordered["observed_at"] = pd.to_datetime(ordered["observed_at"], utc=True)
+    ordered = ordered.sort_values("observed_at")
+    complete = ordered.dropna(subset=list(CONTEXT_FEATURES))
+    table = pd.DataFrame(index=unique_times, columns=list(CONTEXT_FEATURES), dtype=float)
+    table["context_is_fresh"] = 0.0
+    if not complete.empty:
+        # `DatetimeIndex.to_frame(name)` pone las marcas en el INDICE, no en una columna,
+        # y `merge_asof` terminaba buscando `feature_available_at` en el indice y fallando.
+        left = pd.DataFrame({"feature_available_at": unique_times})
+        merged = pd.merge_asof(
+            left,
+            complete.loc[:, ["observed_at", *CONTEXT_FEATURES]].rename(
+                columns={"observed_at": "context_observed_at"}
+            ),
+            left_on="feature_available_at",
+            right_on="context_observed_at",
+            direction="backward",
+        )
+        age_minutes = (
+            (merged["feature_available_at"] - merged["context_observed_at"]).dt.total_seconds()
+            / 60.0
+        ).to_numpy(dtype=float)
+        table.loc[:, list(CONTEXT_FEATURES)] = merged[list(CONTEXT_FEATURES)].to_numpy(dtype=float)
+        table["context_is_fresh"] = (age_minutes <= MAX_CONTEXT_AGE_MINUTES).astype(float)
+    stale = table.index[table["context_is_fresh"] == 0.0]
+    if len(stale):
+        table.loc[stale, list(CONTEXT_FEATURES)] = _context_window_median(ordered, stale)
+    aligned = table.fillna(0.0).reindex(times.to_numpy())
+    aligned.index = times.index
+    return aligned
+
+
+
 def add_features(
     observations: pd.DataFrame,
     context: pd.DataFrame,
@@ -97,32 +199,55 @@ def add_features(
 ) -> pd.DataFrame:
     if history_gap_steps < 0:
         raise ValueError("history_gap_steps no puede ser negativo.")
+    gap = int(history_gap_steps)
     frame = observations.copy()
-    frame["feature_available_at"] = frame["observed_at"] - pd.Timedelta(
-        minutes=history_gap_steps * 15
-    )
-    available_context = context.rename(columns={"observed_at": "feature_available_at"})
-    frame = frame.merge(
-        available_context,
-        on="feature_available_at",
-        how="left",
-        validate="many_to_one",
-    )
+    frame["observed_at"] = pd.to_datetime(frame["observed_at"], utc=True)
     frame = frame.sort_values(["station_id", "observed_at"]).copy()
     grouped_demand = frame.groupby("station_id", sort=False)[TARGET]
 
     for lag in LAGS:
-        frame[f"demand_lag_{lag}"] = grouped_demand.shift(max(lag, history_gap_steps))
+        frame[f"demand_lag_{lag}"] = grouped_demand.shift(max(lag, gap))
 
     for window in ROLLING_WINDOWS:
         frame[f"demand_mean_{window}"] = grouped_demand.transform(
-            lambda values: values.shift(max(1, history_gap_steps)).rolling(window).mean()
+            lambda values: values.shift(max(1, gap)).rolling(window).mean()
         )
 
     for window in ROLLING_STD_WINDOWS:
         frame[f"demand_std_{window}"] = grouped_demand.transform(
-            lambda values: values.shift(max(1, history_gap_steps)).rolling(window).std()
+            lambda values: values.shift(max(1, gap)).rolling(window).std()
         )
+
+    # Escalera de recencia: los lags heredados eran copias del primero; esta escala si
+    # recorre la trayectoria publicable (ultima fila .. 24 h antes que esa misma fila).
+    for offset in VISIBLE_LAG_OFFSETS:
+        frame[f"visible_lag_{offset}"] = grouped_demand.shift(gap + offset)
+
+    # Referencias estacionales alineadas al instante objetivo, solo con dias que a esa
+    # altura ya estan publicados. d=7 es, paso a paso, la baseline del ensemble.
+    rolling_reference = f"demand_mean_{max(ROLLING_WINDOWS)}"
+    for horizon in HORIZONS:
+        target_minutes = horizon * PERIOD_MINUTES
+        references: list[str] = []
+        for days in TARGET_SEASONAL_DAYS:
+            shift_steps = PERIODS_PER_DAY * days - horizon
+            if shift_steps < gap:
+                continue
+            column = f"target_lag_{days}d_{target_minutes}"
+            frame[column] = grouped_demand.shift(shift_steps)
+            references.append(column)
+        if not references:
+            continue
+        frame[f"target_seasonal_mean_{target_minutes}"] = frame[references].mean(axis=1)
+        frame[f"target_seasonal_std_{target_minutes}"] = frame[references].std(axis=1)
+        # Cuanto se separa el nivel reciente del nivel historico de este mismo cuarto
+        # horario: senal de deriva que un arbol no reconstruye restando dos columnas.
+        frame[f"level_gap_{target_minutes}"] = (
+            frame[rolling_reference] - frame[f"target_seasonal_mean_{target_minutes}"]
+        )
+
+    frame["demand_level_shift_4_96"] = frame["demand_mean_4"] - frame[rolling_reference]
+    frame["demand_level_shift_16_96"] = frame["demand_mean_16"] - frame[rolling_reference]
 
     for horizon in HORIZONS:
         target_minutes = horizon * 15
@@ -143,18 +268,47 @@ def add_features(
     frame["weekday_sin"] = np.sin(2 * np.pi * frame["day_of_week"] / 7)
     frame["weekday_cos"] = np.cos(2 * np.pi * frame["day_of_week"] / 7)
 
+    # El contexto se reconstruye con las reglas exactas de la inferencia: fresco si tiene
+    # <= 60 minutos, si no mediana de los ultimos 7 dias (ver `_context_lookup`).
+    frame["feature_available_at"] = frame["observed_at"] - pd.Timedelta(
+        minutes=gap * PERIOD_MINUTES
+    )
+    context_frame = _context_lookup(context, frame["feature_available_at"])
+    for column in CONTEXT_FEATURES:
+        frame[column] = context_frame[column].to_numpy(dtype=float)
+    frame["context_is_fresh"] = context_frame["context_is_fresh"].to_numpy(dtype=float)
+
+    seasonal_columns = [
+        f"target_lag_{days}d_{horizon * PERIOD_MINUTES}"
+        for horizon in HORIZONS
+        for days in TARGET_SEASONAL_DAYS
+        if PERIODS_PER_DAY * days - horizon >= gap
+    ]
+    seasonal_aggregates = [
+        f"{aggregate}_{horizon * PERIOD_MINUTES}"
+        for horizon in HORIZONS
+        for aggregate in ("target_seasonal_mean", "target_seasonal_std", "level_gap")
+        if f"target_seasonal_mean_{horizon * PERIOD_MINUTES}" in frame.columns
+    ]
     feature_columns = [
+        # Los lags heredados siguen en el frame: `demand_lag_{672 - horizon}` es la
+        # baseline estacional del ensemble y el campeon los necesita al emparejar, pero
+        # `model_feature_columns()` los deja fuera del candidato.
         *(f"demand_lag_{lag}" for lag in LAGS),
+        *(f"visible_lag_{offset}" for offset in VISIBLE_LAG_OFFSETS),
         *(f"demand_mean_{window}" for window in ROLLING_WINDOWS),
         *(f"demand_std_{window}" for window in ROLLING_STD_WINDOWS),
+        "demand_level_shift_4_96",
+        "demand_level_shift_16_96",
+        *seasonal_columns,
+        *seasonal_aggregates,
         *(
             f"target_{feature}_{horizon * 15}"
             for horizon in HORIZONS
             for feature in ("is_weekend", "quarter_sin", "quarter_cos", "weekday_sin", "weekday_cos")
         ),
-        "rain_forecast",
-        "temperature_forecast",
-        "event_intensity",
+        *CONTEXT_FEATURES,
+        "context_is_fresh",
         "is_weekend",
         "quarter_sin",
         "quarter_cos",
@@ -169,6 +323,24 @@ def add_features(
     return encoded
 
 
+def model_feature_columns(columns: Any) -> list[str]:
+    """Columnas que ven los modelos candidatos: el frame completo menos los heredados.
+
+    `demand_lag_*` se calcula igual que siempre para no romper la comparacion emparejada
+    con el campeon ni la baseline estacional, pero los 11 lags cortos eran copias exactas
+    entre si y `demand_lag_668..672` quedan cubiertos por `target_lag_*d_*`, que esta
+    alineada al instante objetivo. Un duplicado exacto no aporta señal y si diluye las
+    divisiones del arbol, asi que el candidato entrena sin ellos.
+    """
+
+    return [
+        column
+        for column in columns
+        if column not in {"observed_at", TARGET, "station_id"}
+        and not str(column).startswith(RETIRED_FEATURE_PREFIXES)
+    ]
+
+
 def feature_columns_for_horizon(feature_columns: list[str], horizon_minutes: int) -> list[str]:
     target_calendar_prefixes = (
         "target_is_weekend_",
@@ -176,6 +348,10 @@ def feature_columns_for_horizon(feature_columns: list[str], horizon_minutes: int
         "target_quarter_cos_",
         "target_weekday_sin_",
         "target_weekday_cos_",
+        "target_lag_",
+        "target_seasonal_mean_",
+        "target_seasonal_std_",
+        "level_gap_",
     )
     return [
         column for column in feature_columns
@@ -357,6 +533,38 @@ def champion_rows_for_horizon(
 
 
 
+def champion_history_gap(config: dict[str, Any]) -> int:
+    """Hueco con el que se entreno (y se sirve) un horizonte del campeon."""
+
+    return int(config.get("history_gap_steps", LEGACY_HISTORY_GAP_STEPS))
+
+
+def align_champion_validation(
+    champion_frame: pd.DataFrame, validation: pd.DataFrame, horizon: int
+) -> pd.DataFrame:
+    """Filas del campeon construidas con SU hueco, para los mismos objetivos del candidato.
+
+    El candidato y el campeon pueden leer historia con huecos distintos (0 frente al
+    133 heredado). Cada uno se puntua con la informacion que tendria al enviar y sobre
+    exactamente las mismas parejas estacion + instante: esa es la comparacion que
+    describe produccion.
+    """
+
+    keyed = champion_frame.copy()
+    keyed["target"] = keyed.groupby("station_id", sort=False)[TARGET].shift(-horizon)
+    keyed = keyed.dropna(subset=["target"]).set_index(["station_id", "observed_at"])
+    keys = pd.MultiIndex.from_frame(validation[["station_id", "observed_at"]])
+    missing = keys.difference(keyed.index)
+    if len(missing):
+        raise ValueError(
+            f"El campeon no tiene {len(missing)} filas de la fold del candidato con su hueco; "
+            "la comparacion emparejada no seria sobre los mismos objetivos."
+        )
+    aligned = keyed.loc[keys].reset_index()
+    aligned.index = validation.index
+    return aligned
+
+
 def score(
     name: str,
     fold: int,
@@ -459,6 +667,11 @@ def save_best_models(
                     "hgb_model": model_name,
                     "hgb_weight": hgb_weight,
                     "baseline": "Seasonal Naive 7d",
+                    "baseline_lag": 672 - horizon,
+                    "history_gap_steps": TRAINING_HISTORY_GAP_STEPS,
+                    "feature_protocol": FEATURE_PROTOCOL,
+                    "target_seasonal_days": list(TARGET_SEASONAL_DAYS),
+                    "station_count": EXPECTED_STATION_COUNT,
                     "feature_columns": horizon_feature_columns,
                     "training_rows": len(horizon_frame),
                 },
@@ -532,9 +745,7 @@ def run_experiment(
     observations, context, snapshot = load_dataset_frames()
     frame = add_features(observations, context)
 
-    feature_columns = [
-        column for column in frame.columns if column not in {"observed_at", TARGET, "station_id"}
-    ]
+    feature_columns = model_feature_columns(frame.columns)
     anchor, fold_starts = resolve_fold_starts(
         frame, validation_anchor, holdout_days=holdout_days
     )
@@ -556,6 +767,9 @@ def run_experiment(
         f"campeon: {champion_label or 'sin emparejar'}."
     )
     metric_rows: list[dict[str, object]] = []
+    # Frames de features por hueco: el del candidato y, si difiere, el del campeon.
+    frames_by_gap: dict[int, pd.DataFrame] = {TRAINING_HISTORY_GAP_STEPS: frame}
+    champion_gaps: set[int] = set()
 
     for horizon in HORIZONS:
         horizon_frame = frame.copy()
@@ -613,8 +827,18 @@ def run_experiment(
             if champion_bundle is not None and horizon * 15 in champion_bundle:
                 # El campeon se evalua sobre estas mismas filas: el delta deja de
                 # ser "dos epocas distintas" y pasa a ser una comparacion emparejada.
+                champion_gap = champion_history_gap(champion_bundle[horizon * 15][1])
+                champion_gaps.add(champion_gap)
+                if champion_gap not in frames_by_gap:
+                    frames_by_gap[champion_gap] = add_features(
+                        observations, context, champion_gap
+                    )
                 incumbent_rows = champion_rows_for_horizon(
-                    champion_bundle, str(champion_label), fold, horizon, validation
+                    champion_bundle,
+                    str(champion_label),
+                    fold,
+                    horizon,
+                    align_champion_validation(frames_by_gap[champion_gap], validation, horizon),
                 )
                 metric_rows.extend(incumbent_rows)
                 with mlflow.start_run(
@@ -695,6 +919,10 @@ def run_experiment(
         {fold: window[1] for fold, window in fold_windows.items()}
     )
     metrics["history_gap_steps"] = TRAINING_HISTORY_GAP_STEPS
+    if champion_label is not None and champion_gaps:
+        # Un campeon que conservo horizontes viejos puede mezclar huecos; cada horizonte ya
+        # se puntuo con el suyo, y la compuerta necesita un solo valor: el mas atrasado.
+        metrics.loc[metrics["model"] == champion_label, "history_gap_steps"] = max(champion_gaps)
     metrics["dataset_name"] = snapshot.get("dataset_name", "")
     metrics["dataset_id"] = snapshot.get("dataset_id") or ""
     metrics["dataset_rows_hash"] = snapshot.get("rows_hash") or ""
@@ -709,6 +937,7 @@ def run_experiment(
         "holdout_days": holdout_days,
         "fold_days": VALIDATION_FOLD_DAYS,
         "history_gap_steps": TRAINING_HISTORY_GAP_STEPS,
+        "feature_protocol": FEATURE_PROTOCOL,
         "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
         "dataset_name": snapshot.get("dataset_name"),
         "dataset_id": snapshot.get("dataset_id"),

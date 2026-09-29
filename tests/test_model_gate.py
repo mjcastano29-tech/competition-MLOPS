@@ -252,3 +252,21 @@ def test_una_estacion_rompiendose_bloquea_aunque_todas_las_demas_mejoren():
     tolerado = evaluate_promotion(candidate, incumbent, max_station_drop=5.0)
     assert tolerado.decision == "paired_improvement"
 
+
+
+def test_candidato_con_historia_mas_fresca_es_comparable():
+    decision = evaluate_promotion(
+        make_evaluation(BETTER, history_gap=0), make_evaluation(BASE_INCUMBENT, history_gap=133)
+    )
+
+    assert decision.promote
+    assert decision.decision == "paired_improvement"
+
+
+def test_candidato_con_historia_mas_atrasada_no_es_comparable():
+    decision = evaluate_promotion(
+        make_evaluation(BETTER, history_gap=133), make_evaluation(BASE_INCUMBENT, history_gap=0)
+    )
+
+    assert not decision.promote
+    assert decision.decision == "incomparable"

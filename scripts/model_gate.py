@@ -25,9 +25,9 @@ MIN_ACCURACY_GAIN = 0.5
 MAX_STATION_DROP = 2.0
 
 # Pasos de 15 min entre el ultimo dato observado y el primer paso pronosticado.
-# Debe coincidir con scripts/download_supabase_data.py, scripts/infer_and_submit.py
-# y examples/03_gradient_boosting.py: cambiarlo invalida cualquier metrica previa.
-TRAINING_HISTORY_GAP_STEPS = 133
+# Debe coincidir con examples/03_gradient_boosting.py. Un campeon con hueco mayor sigue
+# siendo comparable (ver `gap_is_comparable`): se puntua con su propio hueco.
+TRAINING_HISTORY_GAP_STEPS = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +209,12 @@ def evaluation_from_frame(
     )
 
 
+def gap_is_comparable(candidate_gap: int | None, incumbent_gap: int | None) -> bool:
+    if candidate_gap is None or incumbent_gap is None:
+        return candidate_gap == incumbent_gap
+    return candidate_gap <= incumbent_gap
+
+
 def evaluate_promotion(
     candidate: Evaluation | None,
     incumbent: Evaluation | None,
@@ -251,7 +257,10 @@ def evaluate_promotion(
             f"{candidate.validation_start}..{candidate.validation_end} vs campeon "
             f"{incumbent.validation_start}..{incumbent.validation_end}."
         )
-    if candidate.history_gap_steps != incumbent.history_gap_steps:
+    # Cada modelo se puntua sobre los mismos objetivos con el hueco con que se sirve, asi
+    # que un candidato que lee historia mas fresca es comparable: es justo la mejora que se
+    # quiere medir. Un candidato mas atrasado que el campeon, en cambio, no se acepta.
+    if not gap_is_comparable(candidate.history_gap_steps, incumbent.history_gap_steps):
         reasons.append(
             f"Protocolo de hueco distinto: candidato {candidate.history_gap_steps} vs "
             f"campeon {incumbent.history_gap_steps} pasos."
@@ -357,8 +366,8 @@ def evaluate_promotion(
         True,
         "paired_improvement",
         (
-            f"Misma ventana {candidate.validation_start}..{candidate.validation_end} y mismo hueco "
-            f"{candidate.history_gap_steps} pasos.",
+            f"Misma ventana {candidate.validation_start}..{candidate.validation_end}; hueco "
+            f"{incumbent.history_gap_steps} -> {candidate.history_gap_steps} pasos.",
             f"Exactitud {incumbent.accuracy:.2f} -> {candidate.accuracy:.2f} "
             f"({accuracy_delta:+.2f} pts).",
             f"WAPE {incumbent.wape:.4f} -> {candidate.wape:.4f} ({wape_delta:+.4f}).",

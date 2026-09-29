@@ -26,6 +26,14 @@ BUNDLE_ZIP = ROOT / "artifacts" / "pulso_transmi_best_models.zip"
 DEFAULT_HISTORY_GAP_STEPS = 133
 MAX_CONTEXT_AGE_MINUTES = 60
 CONTEXT_FALLBACK_DAYS = 7
+PERIOD_MINUTES = 15
+PERIODS_PER_DAY = 96
+# Ventana de media movil que usa `level_gap_*` en entrenamiento (demand_mean_96).
+LEVEL_REFERENCE_WINDOW = 96
+# Por defecto el protocolo actual de 03_gradient_boosting.py; cada config puede declarar
+# los suyos en `target_seasonal_days`.
+TARGET_SEASONAL_DAYS = (1, 2, 3, 4, 5, 6, 7)
+STREAM_PAGE_SIZE = 5000
 SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
@@ -40,6 +48,12 @@ SUPPORTED_FEATURE_PREFIXES = (
     "demand_lag_",
     "demand_mean_",
     "demand_std_",
+    "demand_level_shift_",
+    "visible_lag_",
+    "target_lag_",
+    "target_seasonal_mean_",
+    "target_seasonal_std_",
+    "level_gap_",
     "target_is_weekend_",
     "target_quarter_sin_",
     "target_quarter_cos_",
@@ -50,6 +64,7 @@ SUPPORTED_FEATURE_NAMES = {
     "rain_forecast",
     "temperature_forecast",
     "event_intensity",
+    "context_is_fresh",
     "is_weekend",
     "quarter_sin",
     "quarter_cos",
@@ -197,7 +212,12 @@ def _feature_row_for_target(
     context_features = sorted(
         {"rain_forecast", "temperature_forecast", "event_intensity"}.intersection(feature_columns)
     )
+    if "context_is_fresh" in feature_columns and not context_features:
+        # La marca de frescura se evalua sobre las tres variables canonicas: si el config
+        # solo pide la marca, hay que leer el contexto igualmente.
+        context_features = sorted({"rain_forecast", "temperature_forecast", "event_intensity"})
     context_values: dict[str, float] = {}
+    context_is_fresh = False
     if context_features:
         historic_context = context[
             context["observed_at"] <= feature_data_cutoff
@@ -235,6 +255,77 @@ def _feature_row_for_target(
             f"No hay historial de demanda para {station_id} hasta {feature_data_cutoff}."
         )
     row: dict[str, float] = {column: 0.0 for column in feature_columns}
+    horizon_steps = int(round((target_at - data_cutoff).total_seconds() / (PERIOD_MINUTES * 60)))
+    # Mismo filtro que add_features(): solo dias cuyo cuarto horario ya es publicable.
+    seasonal_days = tuple(
+        int(days)
+        for days in config.get("target_seasonal_days") or TARGET_SEASONAL_DAYS
+        if PERIODS_PER_DAY * int(days) - horizon_steps >= history_gap_steps
+    )
+    seasonal_cache: dict[int, list[float]] = {}
+
+    def demand_at_steps(steps: int, feature: str) -> float:
+        """Ultima demanda publicada `steps` pasos antes del corte, sin imputar ceros."""
+
+        lag_time = data_cutoff - pd.Timedelta(minutes=steps * PERIOD_MINUTES)
+        last_row = _last_known_row(history, lag_time)
+        if last_row is None or pd.isna(last_row.get("demand")):
+            raise RuntimeError(
+                f"Falta {feature} para {station_id} hasta {lag_time}; "
+                "no se enviará una predicción con variables imputadas."
+            )
+        return safe_float(last_row["demand"])
+
+    def rolling_stat(window: int, feature: str, kind: str) -> float:
+        # add_features() usa shift(max(1, gap)).rolling(window): la ventana termina en la
+        # ultima observacion publicable, no en el corte.
+        rolling_cutoff = data_cutoff - pd.Timedelta(
+            minutes=max(1, history_gap_steps) * PERIOD_MINUTES
+        )
+        recent = history[history["observed_at"] <= rolling_cutoff].tail(window)["demand"]
+        if len(recent) < window:
+            raise RuntimeError(
+                f"Historial insuficiente para {feature} de {station_id}: "
+                f"{len(recent)}/{window} observaciones."
+            )
+        statistic = recent.mean() if kind == "mean" else recent.std()
+        if not math.isfinite(float(statistic)):
+            raise RuntimeError(f"Variable no finita al calcular {feature} para {station_id}.")
+        return float(statistic)
+
+    def seasonal_references(minutes: int, feature: str) -> list[float]:
+        """Demanda del mismo cuarto horario los dias de `TARGET_SEASONAL_DAYS` antes.
+
+        Es el espejo de `shift(96*d - horizon)` en `add_features()`: el instante pedido es
+        `target_at - d dias`, que equivale a retroceder `96*d - horizon` pasos desde el
+        corte. d=7 es exactamente la baseline estacional del ensemble.
+        """
+
+        steps = minutes // PERIOD_MINUTES
+        if steps != horizon_steps:
+            raise RuntimeError(
+                f"{feature} apunta al horizonte {minutes} min pero el objetivo esta a "
+                f"{horizon_steps * PERIOD_MINUTES} min del corte; el config del modelo y "
+                "el objetivo del ciclo no coinciden."
+            )
+        cached = seasonal_cache.get(minutes)
+        if cached is None:
+            cached = [
+                demand_at_steps(
+                    PERIODS_PER_DAY * days - steps, f"target_lag_{days}d_{minutes}"
+                )
+                for days in seasonal_days
+            ]
+            seasonal_cache[minutes] = cached
+        return cached
+
+    def seasonal_stat(minutes: int, feature: str, kind: str) -> float:
+        values = seasonal_references(minutes, feature)
+        if kind == "mean":
+            return float(sum(values) / len(values))
+        # `add_features()` agrega con pandas, cuya desviacion tipica usa ddof=1.
+        return float(pd.Series(values).std())
+
 
     for feature in feature_columns:
         if feature.startswith("station_id_"):
@@ -267,6 +358,47 @@ def _feature_row_for_target(
                 raise RuntimeError(f"Variable no finita al calcular {feature} para {station_id}.")
             row[feature] = float(statistic)
             continue
+        if feature.startswith("visible_lag_"):
+            # visible_lag_0 es la ultima fila publicable: data_cutoff - gap pasos.
+            offset = int(feature.rsplit("_", 1)[-1])
+            row[feature] = demand_at_steps(history_gap_steps + offset, feature)
+            continue
+        if feature.startswith("target_lag_"):
+            try:
+                _, _, day_token, minute_token = feature.split("_")
+                days, minutes = int(day_token[:-1]), int(minute_token)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Nombre de variable estacional no reconocido: {feature!r}"
+                ) from exc
+            if not day_token.endswith("d") or days not in seasonal_days:
+                raise RuntimeError(
+                    f"{feature!r} pide un dia fuera de {seasonal_days}; el protocolo "
+                    "de features cambio y este paquete no se construyo con el."
+                )
+            row[feature] = seasonal_references(minutes, feature)[seasonal_days.index(days)]
+            continue
+        if feature.startswith(("target_seasonal_mean_", "target_seasonal_std_")):
+            minutes = int(feature.rsplit("_", 1)[-1])
+            kind = "mean" if feature.startswith("target_seasonal_mean_") else "std"
+            row[feature] = seasonal_stat(minutes, feature, kind)
+            continue
+        if feature.startswith("level_gap_"):
+            # media de las ultimas 96 filas publicables - media historica del mismo cuarto.
+            minutes = int(feature.rsplit("_", 1)[-1])
+            row[feature] = rolling_stat(
+                LEVEL_REFERENCE_WINDOW, feature, "mean"
+            ) - seasonal_stat(minutes, feature, "mean")
+            continue
+        if feature.startswith("demand_level_shift_"):
+            windows = feature.removeprefix("demand_level_shift_").split("_")
+            if len(windows) != 2 or not all(token.isdigit() for token in windows):
+                raise RuntimeError(f"Nombre de salto de nivel no reconocido: {feature!r}")
+            recent_window, reference_window = (int(token) for token in windows)
+            row[feature] = rolling_stat(recent_window, feature, "mean") - rolling_stat(
+                reference_window, feature, "mean"
+            )
+            continue
         if feature.startswith((
             "target_is_weekend_",
             "target_quarter_sin_",
@@ -290,6 +422,9 @@ def _feature_row_for_target(
         if feature in {"rain_forecast", "temperature_forecast", "event_intensity"}:
             row[feature] = context_values.get(feature, 0.0)
             continue
+        if feature == "context_is_fresh":
+            row[feature] = 1.0 if context_is_fresh else 0.0
+            continue
         if feature in {"is_weekend", "quarter_sin", "quarter_cos", "weekday_sin", "weekday_cos"}:
             day_of_week = data_cutoff.dayofweek
             quarter_of_day = data_cutoff.hour * 4 + data_cutoff.minute // 15
@@ -310,6 +445,53 @@ def _feature_row_for_target(
         )
 
     return row
+
+
+def refresh_observations_from_stream(client: httpx.Client, data_cutoff: pd.Timestamp) -> None:
+    """Completa `data/observations.csv` con el stream de la API hasta `data_cutoff`.
+
+    Supabase va hasta 30 min atrasado (el colector corre antes del tick que abre el
+    ciclo) y el modelo usa la demanda del propio `data_cutoff`, que la API publica en ese
+    mismo tick. Si el stream falla se sigue con lo de Supabase: los lags toman la ultima
+    fila conocida y la entrega no se pierde.
+    """
+
+    rows: list[dict[str, Any]] = []
+    cursor: str | None = None
+    try:
+        while True:
+            params: dict[str, Any] = {"limit": STREAM_PAGE_SIZE}
+            if cursor:
+                params["cursor"] = cursor
+            response = client.get("/v1/stream/observations", params=params)
+            response.raise_for_status()
+            page = response.json()
+            rows.extend(page.get("data", []))
+            next_cursor = page.get("next_cursor")
+            if not next_cursor or next_cursor == cursor or not page.get("data"):
+                break
+            cursor = next_cursor
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"Aviso: no se pudo leer el stream de la API ({exc}); se usa solo Supabase.")
+        return
+    if not rows:
+        return
+    stream = pd.DataFrame(rows)[["station_id", "observed_at", "demand"]]
+    stream["observed_at"] = pd.to_datetime(stream["observed_at"], utc=True)
+    stream = stream[stream["observed_at"] <= data_cutoff]
+    path = SAMPLE_DATA_PATHS["observations"]
+    stored = pd.read_csv(path, dtype={"station_id": "string"})
+    stored["observed_at"] = pd.to_datetime(stored["observed_at"], utc=True)
+    before = stored["observed_at"].max()
+    merged = pd.concat([stored, stream], ignore_index=True)
+    merged["station_id"] = merged["station_id"].map(normalize_station_id)
+    merged = merged.drop_duplicates(subset=["station_id", "observed_at"], keep="last")
+    merged = merged.sort_values(["station_id", "observed_at"])
+    merged.to_csv(path, index=False)
+    print(
+        f"Stream de la API: ultima observacion {before} -> {merged['observed_at'].max()} "
+        f"(data_cutoff {data_cutoff})."
+    )
 
 
 def normalize_station_id(value: Any) -> str:
@@ -596,6 +778,7 @@ def main() -> int:
             check=True,
             cwd=ROOT,
         )
+        refresh_observations_from_stream(client, cutoff)
         bundle = ensure_bundle_ready()
         predictions = infer_predictions(cycle, bundle)
         validate_predictions(cycle, predictions)

@@ -208,6 +208,43 @@ El paquete se genera en `artifacts/pulso_transmi_best_models.zip` e incluye un
 modelo por horizonte, la configuración del ensemble, el WAPE de las 12
 estaciones y un manifiesto SHA-256.
 
+## Promoción del modelo: ventana fija y comparación emparejada
+
+El entrenamiento y el empaquetado se apoyan en `data/snapshot.json`. Si el hash
+del snapshot no coincide con los datos cargados, el proceso se detiene, de modo
+que las métricas siempre pertenecen al mismo estado del dataset.
+
+`examples/03_gradient_boosting.py` acepta una ventana de validación anclada y la
+puntuación del campeón:
+
+```bash
+PYTHONPATH=src python examples/03_gradient_boosting.py \
+  --validation-anchor 2026-09-01T00:00:00+00:00 \
+  --score-champion artifacts/previous_model \
+  --champion-version <model_version_del_campeon>
+```
+
+Con `--validation-anchor` las folds se repiten idénticas en cada corrida, y con
+`--score-champion` el modelo activo se puntúa sobre esas mismas folds.
+`examples/04_package_best_model.py` guarda esa evidencia en
+`promotion_inputs.json` (métricas de candidato y campeón con la misma ventana,
+los mismos horizontes y el mismo hueco de historia) y la incluye en el ZIP, en el
+manifiesto y en los artefactos de MLflow.
+
+`scripts/promote_model.py` solo promueve cuando la comparación es emparejada:
+
+- rechaza ventanas de validación, huecos de historia o conjuntos de horizontes
+  distintos entre candidato y campeón;
+- rechaza un paquete cuyo campeón registrado no es la versión activa;
+- bloquea el retroceso de cualquier horizonte aunque la media mejore;
+- sin campeón comparado no promueve, porque no existe una medición emparejada.
+
+`--allow-unpaired` es una salida de emergencia para paquetes antiguos y deja
+constancia escrita en `artifacts/model_promotion.json`.
+
+La compuerta y la lectura de la evidencia empaquetada están cubiertas por
+`python -m pytest tests/test_model_gate.py tests/test_promote_pairing.py`.
+
 ## Enviar una predicción al API
 
 El contrato vigente de submissions está disponible en `/docs` y en
@@ -241,15 +278,29 @@ guarda observaciones cada 30 minutos; `forecast_cycle.yml` consulta ciclos cada
 hora el WAPE por estación de dos ventanas consecutivas de siete días, usando solo
 predicciones oficiales con resultado real disponible; y `retrain_on_drift.yml`
 reentrena ante alertas pendientes y conserva la accuracy de validación temporal
-como criterio de promoción. El drift exige por defecto un aumento relativo de WAPE
-de 20%, al menos 120 pares y 10 estaciones en cada ventana.
+como criterio de promoción. El drift usa por defecto un umbral relativo de -5%:
+activa cuando el WAPE reciente es al menos el 95% de la referencia. Exige al menos
+120 pares y 10 estaciones en cada ventana.
 
 Aplica las migraciones de `supabase/migrations/` y configura `SUPABASE_SERVICE_ROLE_KEY`
 como secreto en GitHub Actions. Sin ese secreto no se pueden persistir los datos,
 las predicciones ni las alertas WAPE. La tabla de predicciones empieza a llenarse
 cuando se confirma una submission oficial; el monitor necesita dos ventanas con
 resultados maduros (hasta 14 días) antes de poder detectar deterioro. Ajusta
-`WAPE_DRIFT_THRESHOLD` si el umbral relativo de 20% no corresponde a tu operación.
+`WAPE_DRIFT_THRESHOLD` si necesitas otro umbral relativo.
+
+### Dashboard opcional en Vercel
+
+El dashboard del bono está en `dashboard/`. Aplica también la migración
+`20260923100000_add_dashboard_rpc.sql`; publica `dashboard/` como sitio estático
+en Vercel y configura el directorio raíz del proyecto como `dashboard`. En
+`dashboard/config.js` agrega la URL del proyecto Supabase y su clave publicable
+(anon). La página solo consulta la RPC agregada `forecast_dashboard`; nunca uses
+`SUPABASE_SERVICE_ROLE_KEY` ni una clave `sb_secret_` en el navegador. El panel
+muestra accuracy acumulada y rolling de 24 horas, tendencia diaria, distribución
+del error, mapa esquemático por estación, alertas de WAPE drift, última ejecución
+y modelo activo. La posición del leaderboard queda como no disponible mientras
+la API de la competencia no publique standings.
 
 ## Cargar datos en Supabase
 

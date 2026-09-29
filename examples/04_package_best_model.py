@@ -280,9 +280,7 @@ def main() -> None:
     # que el hash de filas del manifiesto coincida con el de las metricas.
     observations, context, snapshot = module.load_dataset_frames()
     frame = module.add_features(observations, context)
-    feature_columns = [
-        column for column in frame.columns if column not in {"observed_at", module.TARGET, "station_id"}
-    ]
+    feature_columns = module.model_feature_columns(frame.columns)
 
     if PACKAGE_DIR.exists():
         shutil.rmtree(PACKAGE_DIR)
@@ -334,6 +332,8 @@ def main() -> None:
                 "training_rows": len(horizon_frame),
                 "station_count": 12,
                 "history_gap_steps": module.TRAINING_HISTORY_GAP_STEPS,
+                "feature_protocol": module.FEATURE_PROTOCOL,
+                "target_seasonal_days": list(module.TARGET_SEASONAL_DAYS),
                 "recency_half_life_days": module.RECENCY_HALF_LIFE_DAYS,
                 "validation_start": window_report.get("validation_start"),
                 "validation_end": window_report.get("validation_end"),
