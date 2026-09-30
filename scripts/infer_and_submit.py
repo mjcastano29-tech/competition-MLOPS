@@ -51,6 +51,12 @@ BIAS_MIN_SAMPLES = 8
 # guardia la bajada queda en 51.3 y la ganancia en cambios de nivel sostenidos se mantiene.
 SURPRISE_QUARTERS = 4
 SURPRISE_MIN_SAMPLES = 3
+# Respaldo cuando el campeon no puede o no debe responder un target (datos incompatibles).
+CONTEXT_COLUMNS = ("rain_mm", "rain_forecast", "temperature_c", "temperature_forecast", "event_intensity")
+PLAUSIBLE_MAX_RATIO = 10.0
+FALLBACK_CONSTANT = 1.0
+FALLBACK_MODEL_VERSION = "respaldo-persistencia"
+COMPATIBILITY_REPORT = ROOT / "artifacts" / "compatibility_report.json"
 SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
@@ -465,6 +471,15 @@ def _feature_row_for_target(
 
 
 def refresh_observations_from_stream(client: httpx.Client, data_cutoff: pd.Timestamp) -> None:
+    """Envoltorio que nunca falla: un stream con otro esquema no puede costar el ciclo."""
+
+    try:
+        _refresh_observations_from_stream(client, data_cutoff)
+    except Exception as exc:
+        print(f"::warning::No se pudo completar con el stream de la API ({type(exc).__name__}: {exc}); se sigue con los datos locales.")
+
+
+def _refresh_observations_from_stream(client: httpx.Client, data_cutoff: pd.Timestamp) -> None:
     """Completa `data/observations.csv` con el stream de la API hasta `data_cutoff`.
 
     Supabase va hasta 30 min atrasado (el colector corre antes del tick que abre el
@@ -497,7 +512,12 @@ def refresh_observations_from_stream(client: httpx.Client, data_cutoff: pd.Times
     stream["observed_at"] = pd.to_datetime(stream["observed_at"], utc=True)
     stream = stream[stream["observed_at"] <= data_cutoff]
     path = SAMPLE_DATA_PATHS["observations"]
-    stored = pd.read_csv(path, dtype={"station_id": "string"})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stored = (
+        pd.read_csv(path, dtype={"station_id": "string"})
+        if path.exists()
+        else pd.DataFrame(columns=["station_id", "observed_at", "demand"])
+    )
     stored["observed_at"] = pd.to_datetime(stored["observed_at"], utc=True)
     before = stored["observed_at"].max()
     merged = pd.concat([stored, stream], ignore_index=True)
@@ -699,72 +719,279 @@ def station_bias_factors(
     return factors
 
 
-def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
-    observations = pd.read_csv(
-        SAMPLE_DATA_PATHS["observations"],
-        dtype={"station_id": "string"},
-        parse_dates=["observed_at"],
-    )
-    context = pd.read_csv(SAMPLE_DATA_PATHS["context"], parse_dates=["observed_at"])
-    observations["station_id"] = observations["station_id"].map(normalize_station_id)
+def load_inference_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Observaciones y contexto locales; vacios (con columnas) si no hay archivos."""
 
-    targets = cycle["targets"]
-    data_cutoff = pd.to_datetime(cycle["data_cutoff"])
-    target_stations = {normalize_station_id(target["station_id"]) for target in targets}
-    available_stations = set(
-        observations.loc[observations["observed_at"] <= data_cutoff, "station_id"].dropna()
-    )
-    missing_stations = sorted(target_stations - available_stations)
-    if missing_stations:
-        raise RuntimeError(
-            "No hay historial de observaciones hasta el data_cutoff para estas estaciones: "
-            + ", ".join(missing_stations)
+    obs_path, ctx_path = SAMPLE_DATA_PATHS["observations"], SAMPLE_DATA_PATHS["context"]
+    if obs_path.exists():
+        observations = pd.read_csv(obs_path, dtype={"station_id": "string"})
+    else:
+        observations = pd.DataFrame(columns=["station_id", "observed_at", "demand"])
+    observations["observed_at"] = pd.to_datetime(observations["observed_at"], utc=True)
+    observations["station_id"] = observations["station_id"].map(normalize_station_id)
+    observations["demand"] = pd.to_numeric(observations["demand"], errors="coerce")
+    if ctx_path.exists():
+        context = pd.read_csv(ctx_path)
+    else:
+        context = pd.DataFrame(columns=["observed_at", *CONTEXT_COLUMNS])
+    context["observed_at"] = pd.to_datetime(context["observed_at"], utc=True)
+    return observations, context
+
+
+def champion_stations(bundle: dict[int, tuple[Path, dict[str, Any]]]) -> set[str] | None:
+    """Estaciones que el campeon conoce por su one-hot; None si no usa one-hot."""
+
+    stations = {
+        column.removeprefix("station_id_")
+        for _, config in bundle.values()
+        for column in config.get("feature_columns") or []
+        if column.startswith("station_id_")
+    }
+    return stations or None
+
+
+def compatibility_report(
+    cycle: dict[str, Any],
+    bundle: dict[int, tuple[Path, dict[str, Any]]],
+    observations: pd.DataFrame,
+    bundle_error: str | None = None,
+) -> dict[str, Any]:
+    """Que partes del ciclo puede atender el campeon y por que no las demas.
+
+    Distingue incompatibilidad (el campeon no sabe o no deberia responder) de drift (sabe
+    responder aunque el nivel cambie): solo lo primero manda targets al respaldo.
+    """
+
+    targets = cycle.get("targets") or []
+    data_cutoff = pd.to_datetime(cycle["data_cutoff"], utc=True)
+    reasons: list[str] = []
+    if bundle_error:
+        reasons.append(f"el paquete del campeon no carga: {bundle_error}")
+    horizons = sorted({
+        int((pd.to_datetime(t["target_at"], utc=True) - data_cutoff).total_seconds() // 60) for t in targets
+    })
+    unsupported = [h for h in horizons if bundle and h not in bundle]
+    if unsupported:
+        reasons.append(f"horizontes sin modelo: {unsupported} min")
+    off_grid = [h for h in horizons if h <= 0 or h % PERIOD_MINUTES]
+    if off_grid or data_cutoff.minute % PERIOD_MINUTES:
+        reasons.append(f"targets fuera de la grilla de {PERIOD_MINUTES} min: {off_grid or 'corte'}")
+    target_stations = {normalize_station_id(t["station_id"]) for t in targets}
+    known = champion_stations(bundle)
+    unknown = sorted(target_stations - known) if known is not None else []
+    if unknown:
+        reasons.append(f"estaciones que el campeon no conoce: {unknown}")
+    history = observations.loc[observations["observed_at"] <= data_cutoff]
+    with_history = set(history["station_id"].dropna())
+    without_history = sorted(target_stations - with_history)
+    if without_history:
+        reasons.append(f"estaciones sin historial hasta el corte: {without_history}")
+    frequency = None
+    recent = history.loc[history["observed_at"] > data_cutoff - pd.Timedelta(days=2)]
+    if not recent.empty:
+        steps = (
+            recent.sort_values("observed_at").groupby("station_id")["observed_at"].diff().dropna()
+            .dt.total_seconds().div(60)
         )
-    print(f"Historial disponible para {len(target_stations)} estaciones objetivo.")
-    latest_observation = observations.loc[
-        observations["observed_at"] <= data_cutoff, "observed_at"
-    ].max()
+        if not steps.empty:
+            frequency = float(steps.median())
+            if abs(frequency - PERIOD_MINUTES) > 0.5:
+                reasons.append(f"frecuencia de observaciones de {frequency:g} min (el campeon usa {PERIOD_MINUTES})")
+    expected = cycle.get("expected_predictions")
+    if expected is not None and int(expected) != len(targets):
+        reasons.append(f"el ciclo pide {expected} predicciones pero trae {len(targets)} targets")
+    return {
+        "cycle_id": cycle.get("cycle_id"),
+        "data_cutoff": data_cutoff.isoformat(),
+        "compatible": not reasons,
+        "reasons": reasons,
+        "unsupported_horizons": unsupported,
+        "unknown_stations": unknown,
+        "stations_without_history": without_history,
+        "frequency_minutes": frequency,
+        # Con otra frecuencia o sin paquete, los lags del campeon no significan lo mismo:
+        # no se le confia ningun target, aunque el horizonte y la estacion existan.
+        "champion_enabled": bool(bundle) and not off_grid and (
+            frequency is None or abs(frequency - PERIOD_MINUTES) <= 0.5
+        ),
+    }
+
+
+def fallback_value(
+    station_id: str, data_cutoff: pd.Timestamp, observations: pd.DataFrame
+) -> tuple[float | None, str]:
+    """Persistencia: ultima demanda publicada de la estacion hasta el corte."""
+
+    history = observations.loc[
+        (observations["station_id"] == station_id) & (observations["observed_at"] <= data_cutoff)
+    ].dropna(subset=["demand"])
+    if history.empty:
+        return None, "sin_historial"
+    value = float(history.sort_values("observed_at")["demand"].iloc[-1])
+    return (value, "persistencia") if math.isfinite(value) and value >= 0 else (None, "sin_historial")
+
+
+def plausible(value: float, station_id: str, data_cutoff: pd.Timestamp, observations: pd.DataFrame) -> bool:
+    """Descarta salidas absurdas del campeon: no finitas, negativas o 10x el maximo reciente."""
+
+    if not math.isfinite(value) or value < 0:
+        return False
+    recent = observations.loc[
+        (observations["station_id"] == station_id)
+        & (observations["observed_at"] <= data_cutoff)
+        & (observations["observed_at"] > data_cutoff - pd.Timedelta(days=7)),
+        "demand",
+    ].dropna()
+    ceiling = max(float(recent.max()) * PLAUSIBLE_MAX_RATIO, 50.0) if not recent.empty else 1e5
+    return value <= ceiling
+
+
+def infer_predictions_with_report(
+    cycle: dict[str, Any],
+    bundle: dict[int, tuple[Path, dict[str, Any]]],
+    bundle_error: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Una prediccion valida por target, pase lo que pase: campeon y, si no, respaldo.
+
+    El batch es atomico en la API: un target sin prediccion cuesta el ciclo completo y la
+    racha. Cada target intenta el campeon; si el campeon no aplica (horizonte o estacion
+    desconocidos, otra frecuencia, paquete roto), falla o devuelve algo absurdo, se usa la
+    persistencia; sin historial de la estacion, la mediana del resto del ciclo; y como
+    ultimo recurso una constante. El reporte dice cuantos targets fueron por cada via.
+    """
+
+    observations, context = load_inference_frames()
+    targets = cycle["targets"]
+    data_cutoff = pd.to_datetime(cycle["data_cutoff"], utc=True)
+    report = compatibility_report(cycle, bundle, observations, bundle_error)
+    for reason in report["reasons"]:
+        print(f"::warning::Compatibilidad: {reason}")
+    latest_observation = observations.loc[observations["observed_at"] <= data_cutoff, "observed_at"].max()
     if pd.notna(latest_observation):
         history_age_minutes = (data_cutoff - latest_observation).total_seconds() / 60
         print(f"Antigüedad de la última observación al data_cutoff: {history_age_minutes:.0f} minutos.")
-    predictions: list[dict[str, Any]] = []
+
     loaded_models: dict[int, Any] = {}
-    for horizon, (model_path, _) in bundle.items():
-        with model_path.open("rb") as stream:
-            loaded_models[horizon] = pickle.load(stream)
+    if report["champion_enabled"]:
+        for horizon, (model_path, _) in bundle.items():
+            try:
+                with model_path.open("rb") as stream:
+                    loaded_models[horizon] = pickle.load(stream)
+            except Exception as exc:  # un pickle roto no puede costar el ciclo
+                report["reasons"].append(f"modelo de {horizon} min no carga: {exc}")
+                report["compatible"] = False
+    known = champion_stations(bundle)
+    target_stations = {normalize_station_id(t["station_id"]) for t in targets}
     factors: dict[str, float] = {}
-    if os.getenv("BIAS_CORRECTION", "on").lower() not in {"off", "0", "false"}:
+    if loaded_models and os.getenv("BIAS_CORRECTION", "on").lower() not in {"off", "0", "false"}:
         try:
             factors = station_bias_factors(
-                target_stations, data_cutoff, observations, context, bundle, loaded_models
+                target_stations if known is None else target_stations & known,
+                data_cutoff, observations, context,
+                {h: bundle[h] for h in loaded_models}, loaded_models,
             )
             corrected = {station: round(f, 3) for station, f in factors.items() if f != 1.0}
             print(f"Correccion de sesgo ({BIAS_WINDOW_HOURS} h): {corrected or 'ninguna estacion fuera de la zona muerta'}")
         except Exception as exc:  # la correccion nunca debe costar un ciclo
             factors = {}
             print(f"Aviso: correccion de sesgo desactivada en este ciclo ({exc}).")
+
+    predictions: list[dict[str, Any]] = []
+    sources: list[str] = []
+    failures: dict[str, int] = {}
     for target in targets:
         station_id = normalize_station_id(target["station_id"])
-        target_at = pd.to_datetime(target["target_at"])
+        target_at = pd.to_datetime(target["target_at"], utc=True)
         horizon_minutes = int((target_at - data_cutoff).total_seconds() // 60)
-        if horizon_minutes not in bundle:
-            raise ValueError(f"No hay modelo empaquetado para horizonte de {horizon_minutes} minutos.")
-        _, config = bundle[horizon_minutes]
-        value = predict_value(
-            station_id, target_at, data_cutoff, observations, context,
-            loaded_models[horizon_minutes], config,
-        )
-        value *= factors.get(station_id, 1.0)
-        predictions.append({
-            "station_id": station_id,
-            "target_at": target["target_at"],
-            "value": round(max(value, 0.0), 4),
-        })
+        value: float | None = None
+        source = "campeon"
+        if horizon_minutes in loaded_models and (known is None or station_id in known):
+            try:
+                candidate = predict_value(
+                    station_id, target_at, data_cutoff, observations, context,
+                    loaded_models[horizon_minutes], bundle[horizon_minutes][1],
+                ) * factors.get(station_id, 1.0)
+                if plausible(candidate, station_id, data_cutoff, observations):
+                    value = candidate
+                else:
+                    failures["prediccion_fuera_de_rango"] = failures.get("prediccion_fuera_de_rango", 0) + 1
+            except Exception as exc:
+                key = type(exc).__name__
+                failures[key] = failures.get(key, 0) + 1
+        if value is None:
+            value, source = fallback_value(station_id, data_cutoff, observations)
+        predictions.append({"station_id": station_id, "target_at": target["target_at"], "value": value})
+        sources.append(source)
 
-    return predictions
+    finite = [item["value"] for item in predictions if item["value"] is not None]
+    cycle_median = float(pd.Series(finite).median()) if finite else FALLBACK_CONSTANT
+    for item, source_index in zip(predictions, range(len(sources))):
+        if item["value"] is None:
+            item["value"] = cycle_median
+            sources[source_index] = "mediana_del_ciclo" if finite else "constante"
+        item["value"] = round(max(float(item["value"]), 0.0), 4)
+
+    counts = {name: sources.count(name) for name in dict.fromkeys(sources)}
+    report.update({
+        "total_targets": len(predictions),
+        "champion_targets": counts.get("campeon", 0),
+        "fallback_targets": len(predictions) - counts.get("campeon", 0),
+        "sources": counts,
+        "champion_failures": failures,
+    })
+    if report["fallback_targets"] and report["compatible"]:
+        # Todo parecia compatible, pero el campeon fallo en targets concretos: tambien es
+        # una senal de que el modelo ya no sirve para estos datos.
+        report["compatible"] = False
+        report["reasons"].append(
+            f"el campeon fallo en {report['fallback_targets']} targets: {failures or 'sin detalle'}"
+        )
+    print(
+        f"Fuentes de prediccion: {counts} · compatible={report['compatible']}"
+        + (f" · fallas del campeon {failures}" if failures else "")
+    )
+    return predictions, report
+
+
+def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
+    return infer_predictions_with_report(cycle, bundle)[0]
+
+
+def persist_compatibility(report: dict[str, Any], model_version: str | None) -> None:
+    """Guarda el chequeo en Supabase para el dashboard; nunca interrumpe la entrega."""
+
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not service_key:
+        return
+    supabase_url = os.getenv("SUPABASE_URL", "https://jwlgxabibcticikhjhzf.supabase.co").rstrip("/")
+    row = {
+        "cycle_id": report.get("cycle_id"),
+        "data_cutoff": report.get("data_cutoff"),
+        "compatible": bool(report.get("compatible")),
+        "total_targets": report.get("total_targets"),
+        "champion_targets": report.get("champion_targets"),
+        "fallback_targets": report.get("fallback_targets"),
+        "reasons": report.get("reasons", []),
+        "sources": report.get("sources", {}),
+        "model_version": model_version,
+    }
+    try:
+        response = httpx.post(
+            f"{supabase_url}/rest/v1/model_compatibility",
+            params={"on_conflict": "cycle_id"},
+            json=[row],
+            headers={**supabase_request_headers(service_key), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            timeout=30.0,
+        )
+        if response.is_error:
+            print(f"Aviso: no se guardo el chequeo de compatibilidad (HTTP {response.status_code}).")
+    except httpx.HTTPError as exc:
+        print(f"Aviso: no se guardo el chequeo de compatibilidad ({exc}).")
 
 
 def model_metadata(bundle: dict[int, tuple[Path, dict[str, Any]]]) -> dict[str, str | None]:
+    if not bundle:
+        return {"version": FALLBACK_MODEL_VERSION, "training_data_end": None}
     digest = hashlib.sha256()
     seen: set[Path] = set()
     for model_path, config in bundle.values():
@@ -972,16 +1199,35 @@ def main() -> int:
 
         cutoff = pd.to_datetime(cycle["data_cutoff"], utc=True)
         start_at = (cutoff - pd.Timedelta(days=30)).isoformat()
-        subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "download_supabase_data.py"), "--start-at", start_at],
-            check=True,
-            cwd=ROOT,
-        )
+        try:
+            subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "download_supabase_data.py"), "--start-at", start_at],
+                check=True,
+                cwd=ROOT,
+            )
+        except subprocess.CalledProcessError as exc:
+            # Si el colector se rompe (por ejemplo, con un esquema nuevo de la API), el
+            # stream de la API todavia alcanza para enviar.
+            print(f"::warning::No se pudieron leer los datos de Supabase (codigo {exc.returncode}); se usa el stream de la API.")
         refresh_observations_from_stream(client, cutoff)
-        bundle = ensure_bundle_ready()
-        predictions = infer_predictions(cycle, bundle)
+        bundle_error = None
+        try:
+            bundle = ensure_bundle_ready()
+        except Exception as exc:
+            bundle, bundle_error = {}, f"{type(exc).__name__}: {exc}"
+        predictions, report = infer_predictions_with_report(cycle, bundle, bundle_error)
         validate_predictions(cycle, predictions)
-        payload = build_payload(cycle, predictions, model_metadata(bundle))
+        metadata = model_metadata(bundle)
+        if bundle and report["fallback_targets"]:
+            metadata["version"] = f"{metadata['version']}+respaldo"
+        COMPATIBILITY_REPORT.parent.mkdir(parents=True, exist_ok=True)
+        COMPATIBILITY_REPORT.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_github_output("compatible", str(report["compatible"]).lower())
+        write_github_output("fallback_targets", str(report["fallback_targets"]))
+        write_github_output("total_targets", str(report["total_targets"]))
+        if not args.dry_run:
+            persist_compatibility(report, metadata["version"])
+        payload = build_payload(cycle, predictions, metadata)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Payload generado en {args.output} con {len(predictions)} predicciones.")

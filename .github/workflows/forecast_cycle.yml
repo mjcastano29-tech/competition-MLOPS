@@ -23,6 +23,8 @@ jobs:
       # Permite recuperar el paquete del campeon publicado por el ultimo reentrenamiento
       # cuando el cache del runner llega vacio; sin el, la entrega caeria al bundle viejo.
       actions: read
+      # Abre/cierra el issue que avisa que los datos dejaron de ser compatibles con el campeon.
+      issues: write
     env:
       PULSO_API_URL: ${{ vars.PULSO_API_URL || 'https://pulso-transmi.72-60-245-2.sslip.io' }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
@@ -148,6 +150,56 @@ jobs:
             echo "No se encontró un ciclo abierto en esta ejecución; se volverá a consultar en el siguiente poll." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Alert when the data stopped being compatible with the champion
+        if: always() && (steps.fast_submit.outputs.compatible != '' || steps.final_submit.outputs.compatible != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPATIBLE: ${{ steps.fast_submit.outputs.compatible || steps.final_submit.outputs.compatible }}
+          FALLBACK: ${{ steps.fast_submit.outputs.fallback_targets || steps.final_submit.outputs.fallback_targets }}
+          TOTAL: ${{ steps.fast_submit.outputs.total_targets || steps.final_submit.outputs.total_targets }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=modelo-incompatible
+          open_issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$label" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [[ "$COMPATIBLE" == "true" ]]; then
+            echo "Datos compatibles con el campeon: ${TOTAL} targets con el modelo." >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "$open_issue" ]]; then
+              gh issue close "$open_issue" --repo "$GITHUB_REPOSITORY" \
+                --comment "Compatibilidad restaurada: el ciclo de $RUN_URL uso el campeon en los ${TOTAL} targets."
+            fi
+            exit 0
+          fi
+          echo "::warning::Datos incompatibles con el campeon: ${FALLBACK}/${TOTAL} targets salieron por el respaldo."
+          reasons=$(python3 -c "import json; r=json.load(open('artifacts/compatibility_report.json')); print(chr(10).join('- ' + x for x in r['reasons']) or '- sin detalle'); print(); print('Fuentes: ' + json.dumps(r['sources'], ensure_ascii=False))" 2>/dev/null || echo "- ver el artefacto compatibility-report")
+          {
+            echo "**Datos incompatibles con el campeon.** ${FALLBACK} de ${TOTAL} targets salieron por el respaldo (la racha sigue)."
+            echo
+            echo "$reasons"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$open_issue" ]]; then
+            echo "Ya hay un issue abierto (#$open_issue); no se duplica la alerta."
+            exit 0
+          fi
+          gh label create "$label" --repo "$GITHUB_REPOSITORY" --color d73a4a \
+            --description "Los datos del reto dejaron de ser compatibles con el modelo campeon" 2>/dev/null || true
+          body=$(cat <<EOF
+          Los datos del ciclo ya no son compatibles con el modelo campeon. **La racha no se pierde**: ${FALLBACK} de ${TOTAL} targets se enviaron con el respaldo (persistencia), pero la accuracy va a caer hasta que haya un modelo nuevo.
+
+          ### Que cambio
+          ${reasons}
+
+          ### Que hacer
+          1. Revisar el cambio en la API (\`/v1/meta\`, \`/v1/stations\`, un ciclo de \`/v1/forecast-cycles/current\`).
+          2. Adaptar las features o el protocolo del modelo a los datos nuevos y entrenar un modelo nuevo solo con el regimen nuevo.
+          3. Promoverlo con \`retrain-on-wape-drift\` (force_candidate) cuando le gane al respaldo.
+
+          Este issue se cierra solo cuando un ciclo vuelve a usar el campeon en todos los targets.
+          Run: $RUN_URL
+          EOF
+          )
+          gh issue create --repo "$GITHUB_REPOSITORY" --label "$label" \
+            --title "Datos incompatibles con el modelo: crear un modelo nuevo" --body "$body"
+
       - name: Upload generated submission artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -155,4 +207,5 @@ jobs:
           name: current-submission
           path: |
             artifacts/current_submission.json
+            artifacts/compatibility_report.json
           if-no-files-found: ignore

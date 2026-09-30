@@ -113,6 +113,15 @@ function renderKpis(data) {
 // ---------------------------------------------------------------- alerts
 function buildAlerts(data) {
   const alerts = [];
+  // Datos incompatibles con el campeon: la racha sigue por el respaldo, pero hay que
+  // entrenar un modelo nuevo. Va primero porque es la unica alerta que pide accion manual.
+  const compat = data.compatibility?.latest;
+  if (compat && compat.compatible === false) {
+    const since = data.compatibility.incompatible_since;
+    const reasons = Array.isArray(compat.reasons) && compat.reasons.length ? compat.reasons.join(' · ') : 'sin detalle';
+    alerts.push(['critical', 'Datos incompatibles con el modelo: crear un modelo nuevo',
+      `${compat.fallback_targets} de ${compat.total_targets} targets salieron por el respaldo (la racha sigue)${since ? `, desde ${ago(since)}` : ''}. ${reasons}.`]);
+  }
   const windows = data.windows || {};
   const rolling = windows.rolling_24h || {}, previous = windows.previous_24h || {};
   const ops = data.operations || {}, clock = data.clock || {};
@@ -390,6 +399,17 @@ function renderModels(models) {
   );
 }
 
+function compatibilityItem(compatibility) {
+  const latest = compatibility?.latest;
+  const label = 'Compatibilidad del modelo';
+  const row = (value, detail, level) => [el('dt', {}, label), el('dd', {}, statusBadge(level, value), detail ? el('small', {}, detail) : null)];
+  if (!compatibility) return row('Sin datos', 'aplica la migración 20260930230000_model_compatibility.sql', 'info');
+  if (!latest) return row('Sin chequeos aún', 'se registra en cada entrega', 'info');
+  const day = compatibility.last_24h || {};
+  if (latest.compatible) return row('Compatible', `${number(day.cycles, 0)} ciclos en 24 h · ${number(day.fallback_targets, 0)} targets por respaldo`, 'good');
+  return row(`${latest.fallback_targets}/${latest.total_targets} por respaldo`, `incompatible ${ago(compatibility.incompatible_since)} · crear modelo nuevo`, 'critical');
+}
+
 function renderOps(data) {
   const ops = data.operations || {}, clock = data.clock || {}, drift = data.drift;
   const item = (label, value, detail, level) => [el('dt', {}, label), el('dd', {}, level ? statusBadge(level, value) : el('strong', {}, value), detail ? el('small', {}, detail) : null)];
@@ -404,6 +424,7 @@ function renderOps(data) {
     ...item('Monitor de WAPE', drift ? (drift.detected ? 'Drift detectado' : drift.reference_count ? 'Sin alerta' : 'Sin referencia aún') : 'Sin revisiones',
       drift ? `revisado ${ago(drift.created_at)} · umbral +${pct(Number(drift.threshold ?? 0) * 100, 0)}` : null,
       drift?.detected ? 'critical' : drift?.reference_count ? 'good' : 'info'),
+    ...compatibilityItem(data.compatibility),
     ...item('Referencia de "normal"', `${when(clock.reference_start, { day: '2-digit', month: 'short' })} – ${when(clock.reference_end, { day: '2-digit', month: 'short' })}`, 'primeros 28 días publicados'),
   );
 }
@@ -440,12 +461,17 @@ async function refresh() {
   $('refresh').classList.add('spinning');
   document.body.classList.add('loading');
   try {
-    const response = await fetch(`${config.supabaseUrl.replace(/\/$/, '')}/rest/v1/rpc/forecast_dashboard`, {
+    const rpc = (name) => fetch(`${config.supabaseUrl.replace(/\/$/, '')}/rest/v1/rpc/${name}`, {
       method: 'POST', headers: { apikey: config.anonKey, Authorization: `Bearer ${config.anonKey}`, 'Content-Type': 'application/json' }, body: '{}',
     });
+    const [response, compatibility] = await Promise.all([
+      rpc('forecast_dashboard'),
+      // Opcional: sin la migracion de compatibilidad el dashboard sigue funcionando.
+      rpc('model_compatibility_status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    ]);
     if (!response.ok) throw new Error(`Supabase respondió HTTP ${response.status}`);
     $('notice').classList.remove('show');
-    render(await response.json());
+    render({ ...(await response.json()), compatibility });
   } catch (error) {
     $('updated').textContent = 'No se pudo actualizar';
     $('notice').textContent = `${error.message}. Verifica la migración y la configuración.`;
