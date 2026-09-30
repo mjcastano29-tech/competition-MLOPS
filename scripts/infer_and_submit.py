@@ -34,6 +34,16 @@ LEVEL_REFERENCE_WINDOW = 96
 # los suyos en `target_seasonal_days`.
 TARGET_SEASONAL_DAYS = (1, 2, 3, 4, 5, 6, 7)
 STREAM_PAGE_SIZE = 5000
+# Correccion de sesgo en linea: el factor de cada estacion sale de lo que el campeon habria
+# predicho en los ciclos de las ultimas BIAS_WINDOW_HOURS horas que ya tienen demanda real.
+# Backtest walk-forward (stream real + choques sinteticos de -50 %..+100 %): +0.8 pts en el
+# escenario real, +1.2 con choques y 63.5 -> 76.5 en las 6 h posteriores a un choque; con la
+# zona muerta, la peor estacion estable cede 0.15 pts.
+BIAS_WINDOW_HOURS = 3
+BIAS_ALPHA = 0.5
+BIAS_DEADZONE = 0.05
+BIAS_FACTOR_BOUNDS = (0.5, 2.0)
+BIAS_MIN_SAMPLES = 8
 SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
@@ -534,6 +544,104 @@ def normalize_target_key(value: Any) -> str:
     return str(value)
 
 
+def predict_value(
+    station_id: str,
+    target_at: pd.Timestamp,
+    data_cutoff: pd.Timestamp,
+    observations: pd.DataFrame,
+    context: pd.DataFrame,
+    model: Any,
+    config: dict[str, Any],
+) -> float:
+    """Ensemble del campeon (arbol + baseline estacional + persistencia) para un target."""
+
+    feature_row = _feature_row_for_target(
+        station_id, target_at, data_cutoff, observations, context, config
+    )
+    hgb_value = float(model.predict(pd.DataFrame([feature_row]))[0])
+    hgb_weight = float(config.get("hgb_weight", 1.0))
+    horizon_minutes = int((target_at - data_cutoff).total_seconds() // 60)
+    baseline_lag = int(config.get("baseline_lag", 672 - horizon_minutes // 15))
+    seasonal_value = safe_float(feature_row.get(f"demand_lag_{baseline_lag}"), 0.0)
+    value = hgb_weight * hgb_value + (1 - hgb_weight) * seasonal_value
+    return blend_with_persistence(value, station_id, data_cutoff, observations, config)
+
+
+def bias_factor(
+    matured: list[tuple[float, float]],
+    *,
+    alpha: float = BIAS_ALPHA,
+    deadzone: float = BIAS_DEADZONE,
+    bounds: tuple[float, float] = BIAS_FACTOR_BOUNDS,
+    min_samples: int = BIAS_MIN_SAMPLES,
+) -> float:
+    """Factor multiplicativo desde pares (real, predicho) recientes de una estacion.
+
+    Con pocas muestras o sin demanda devuelve 1. El cociente real/predicho se recorta a
+    `bounds`, solo se corrige la parte del sesgo que excede `deadzone` (el ruido normal de
+    una estacion estable queda intacto) y `alpha` amortigua la reaccion.
+    """
+
+    if len(matured) < min_samples:
+        return 1.0
+    actual = sum(pair[0] for pair in matured)
+    predicted = sum(pair[1] for pair in matured)
+    if actual <= 0 or predicted <= 0:
+        return 1.0
+    ratio = min(max(actual / predicted, bounds[0]), bounds[1])
+    deviation = ratio - 1
+    excess = math.copysign(max(abs(deviation) - deadzone, 0.0), deviation)
+    return min(max(1 + alpha * excess, bounds[0]), bounds[1])
+
+
+def station_bias_factors(
+    stations: Iterable[str],
+    data_cutoff: pd.Timestamp,
+    observations: pd.DataFrame,
+    context: pd.DataFrame,
+    bundle: dict[int, tuple[Path, dict[str, Any]]],
+    loaded_models: dict[int, Any],
+) -> dict[str, float]:
+    """Factor de correccion por estacion con el campeon actual en los ciclos ya observados.
+
+    Recalcula lo que este mismo paquete habria enviado en los cortes horarios de las ultimas
+    `BIAS_WINDOW_HOURS` horas y lo compara con la demanda real de esos targets, que ya esta
+    publicada. No depende de Supabase ni de predicciones de campeones anteriores.
+    """
+
+    actual_by_key = {
+        (row.station_id, row.observed_at): float(row.demand)
+        for row in observations.loc[
+            (observations["observed_at"] <= data_cutoff)
+            & (observations["observed_at"] > data_cutoff - pd.Timedelta(hours=BIAS_WINDOW_HOURS)),
+            ["station_id", "observed_at", "demand"],
+        ].itertuples(index=False)
+        if pd.notna(row.demand)
+    }
+    factors: dict[str, float] = {}
+    for station_id in sorted(set(stations)):
+        matured: list[tuple[float, float]] = []
+        for hours_back in range(1, BIAS_WINDOW_HOURS + 1):
+            past_cutoff = data_cutoff - pd.Timedelta(hours=hours_back)
+            for horizon_minutes, (_, config) in bundle.items():
+                past_target = past_cutoff + pd.Timedelta(minutes=horizon_minutes)
+                if not (data_cutoff - pd.Timedelta(hours=BIAS_WINDOW_HOURS) < past_target <= data_cutoff):
+                    continue
+                actual = actual_by_key.get((station_id, past_target))
+                if actual is None:
+                    continue
+                try:
+                    predicted = predict_value(
+                        station_id, past_target, past_cutoff, observations, context,
+                        loaded_models[horizon_minutes], config,
+                    )
+                except (RuntimeError, ValueError, KeyError):
+                    continue
+                matured.append((actual, max(predicted, 0.0)))
+        factors[station_id] = bias_factor(matured)
+    return factors
+
+
 def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
     observations = pd.read_csv(
         SAMPLE_DATA_PATHS["observations"],
@@ -567,25 +675,29 @@ def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[
     for horizon, (model_path, _) in bundle.items():
         with model_path.open("rb") as stream:
             loaded_models[horizon] = pickle.load(stream)
+    factors: dict[str, float] = {}
+    if os.getenv("BIAS_CORRECTION", "on").lower() not in {"off", "0", "false"}:
+        try:
+            factors = station_bias_factors(
+                target_stations, data_cutoff, observations, context, bundle, loaded_models
+            )
+            corrected = {station: round(f, 3) for station, f in factors.items() if f != 1.0}
+            print(f"Correccion de sesgo ({BIAS_WINDOW_HOURS} h): {corrected or 'ninguna estacion fuera de la zona muerta'}")
+        except Exception as exc:  # la correccion nunca debe costar un ciclo
+            factors = {}
+            print(f"Aviso: correccion de sesgo desactivada en este ciclo ({exc}).")
     for target in targets:
         station_id = normalize_station_id(target["station_id"])
         target_at = pd.to_datetime(target["target_at"])
         horizon_minutes = int((target_at - data_cutoff).total_seconds() // 60)
         if horizon_minutes not in bundle:
             raise ValueError(f"No hay modelo empaquetado para horizonte de {horizon_minutes} minutos.")
-        horizon_key = horizon_minutes
-        _, config = bundle[horizon_key]
-        model = loaded_models[horizon_key]
-        feature_row = _feature_row_for_target(
-            station_id, target_at, data_cutoff, observations, context, config
+        _, config = bundle[horizon_minutes]
+        value = predict_value(
+            station_id, target_at, data_cutoff, observations, context,
+            loaded_models[horizon_minutes], config,
         )
-        frame = pd.DataFrame([feature_row])
-        hgb_value = float(model.predict(frame)[0])
-        hgb_weight = float(config.get("hgb_weight", 1.0))
-        baseline_lag = int(config.get("baseline_lag", 672 - horizon_minutes // 15))
-        seasonal_value = safe_float(feature_row.get(f"demand_lag_{baseline_lag}"), 0.0)
-        value = hgb_weight * hgb_value + (1 - hgb_weight) * seasonal_value
-        value = blend_with_persistence(value, station_id, data_cutoff, observations, config)
+        value *= factors.get(station_id, 1.0)
         predictions.append({
             "station_id": station_id,
             "target_at": target["target_at"],
