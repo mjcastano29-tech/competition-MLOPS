@@ -1,0 +1,8 @@
+{
+  "framework": null,
+  "installCommand": "echo 'Dashboard estatico: sin dependencias'",
+  "buildCommand": "echo 'Dashboard estatico: sin build'",
+  "outputDirectory": "dashboard",
+  "cleanUrls": true,
+  "trailingSlash": false
+}
