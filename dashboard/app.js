@@ -206,7 +206,13 @@ function renderCycleChart(cycles) {
   });
   const days = new Map();
   cycles.forEach((c, i) => { const d = when(c.data_cutoff, { day: '2-digit', month: 'short' }); if (!days.has(d)) days.set(d, i); });
-  for (const [label, i] of days) add('text', { x: x(i), y: height - 8, class: 'tick', 'text-anchor': i === 0 ? 'start' : 'middle' }).textContent = label;
+  // Una etiqueta por dia; si el primer dia es parcial queda pegado al siguiente y se omite.
+  let lastLabelX = -Infinity;
+  for (const [label, i] of days) {
+    if (x(i) - lastLabelX < 64) continue;
+    add('text', { x: x(i), y: height - 8, class: 'tick', 'text-anchor': i === 0 ? 'start' : 'middle' }).textContent = label;
+    lastLabelX = x(i);
+  }
 
   for (const s of [...SERIES].reverse()) {
     let d = '', pen = false;
