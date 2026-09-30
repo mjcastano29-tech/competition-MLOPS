@@ -606,21 +606,11 @@ def refit_champion_recipe(
     return model
 
 
-def champion_rows_for_horizon(
-    bundle: dict[int, tuple[Any, dict[str, Any]]],
-    label: str,
-    fold: int,
-    horizon: int,
-    validation: pd.DataFrame,
-    model: Any | None = None,
-) -> list[dict[str, object]]:
-    """Puntua al campeon sobre la MISMA fold del candidato: comparacion emparejada.
+def champion_base_predictions(
+    model: Any, config: dict[str, Any], validation: pd.DataFrame, horizon: int
+) -> np.ndarray:
+    """Ensemble del campeon (arbol + baseline estacional) antes de mezclar persistencia."""
 
-    `model` sustituye al modelo congelado cuando se puntua la receta reentrenada.
-    """
-
-    frozen_model, config = bundle[horizon * 15]
-    model = frozen_model if model is None else model
     feature_columns = list(config["feature_columns"])
     missing = [column for column in feature_columns if column not in validation.columns]
     if missing:
@@ -633,15 +623,37 @@ def champion_rows_for_horizon(
     weekly_baseline = validation[f"demand_lag_{baseline_lag}"].to_numpy()
     # El DataFrame se pasa con el orden exacto del fit: scikit-learn valida nombres
     # y orden de columnas antes de predecir.
-    predictions = hgb_weight * model.predict(validation.loc[:, feature_columns]) + (
+    return hgb_weight * model.predict(validation.loc[:, feature_columns]) + (
         1 - hgb_weight
     ) * weekly_baseline
-    # Un campeon que ya mezcla persistencia se puntua con sus propios pesos.
+
+
+def champion_rows_for_horizon(
+    bundle: dict[int, tuple[Any, dict[str, Any]]],
+    label: str,
+    fold: int,
+    horizon: int,
+    validation: pd.DataFrame,
+    model: Any | None = None,
+    persistence_weights: dict[str, float] | None = None,
+) -> list[dict[str, object]]:
+    """Puntua al campeon sobre la MISMA fold del candidato: comparacion emparejada.
+
+    `model` sustituye al modelo congelado cuando se puntua la receta reentrenada, y
+    entonces `persistence_weights` trae los pesos walk-forward de la fold anterior: los
+    del config se eligieron sobre la ultima fold y le darian ventaja dentro de la muestra.
+    Con el modelo congelado se usan los del config, que es lo que sirve en produccion.
+    """
+
+    frozen_model, config = bundle[horizon * 15]
+    predictions = champion_base_predictions(
+        frozen_model if model is None else model, config, validation, horizon
+    )
     predictions = apply_persistence_weights(
         predictions,
         validation[PERSISTENCE_COLUMN].to_numpy(),
         validation["station_id"].to_numpy(),
-        config.get("persistence_weights"),
+        config.get("persistence_weights") if model is None else persistence_weights,
     )
     return score(label, fold, horizon, validation, pd.Series(predictions))
 
@@ -902,6 +914,7 @@ def run_experiment(
         # Pesos de persistencia de la fold anterior por ensemble; la primera fold va sin
         # mezcla, porque elegirlos sobre la misma fold que se puntua seria hacer trampa.
         previous_weights: dict[str, dict[str, float]] = {}
+        champion_previous_weights: dict[str, float] = {}
         for fold, validation_start in enumerate(fold_starts, start=1):
             validation_end = validation_start + timedelta(days=VALIDATION_FOLD_DAYS)
             # Leave a horizon-sized embargo so training labels cannot overlap validation.
@@ -971,14 +984,29 @@ def run_experiment(
                             "no existe; se puntua su modelo congelado dentro de la muestra."
                         )
                 champion_scoring.add("frozen" if refit_model is None else "refit")
+                champion_validation = align_champion_validation(
+                    frames_by_gap[champion_gap], validation, horizon
+                )
                 incumbent_rows = champion_rows_for_horizon(
                     champion_bundle,
                     str(champion_label),
                     fold,
                     horizon,
-                    align_champion_validation(frames_by_gap[champion_gap], validation, horizon),
+                    champion_validation,
                     model=refit_model,
+                    persistence_weights=champion_previous_weights,
                 )
+                if refit_model is not None:
+                    # Mismo walk-forward que el candidato: estos pesos valen para la
+                    # siguiente fold, nunca para la que acaba de puntuarse.
+                    champion_previous_weights = choose_persistence_weights(
+                        champion_validation["station_id"].to_numpy(),
+                        champion_validation["target"].to_numpy(),
+                        champion_base_predictions(
+                            refit_model, champion_config, champion_validation, horizon
+                        ),
+                        champion_validation[PERSISTENCE_COLUMN].to_numpy(),
+                    )
                 metric_rows.extend(incumbent_rows)
                 with mlflow.start_run(
                     run_name=f"champion-{champion_version}-h{horizon * 15}-fold{fold}",

@@ -342,3 +342,38 @@ def test_la_receta_del_campeon_solo_ve_datos_previos_al_corte(module):
     assert model.n_features_in_ == len(columns)
     assert expected_rows < len(frame)
     assert module.refit_champion_recipe({**config, "hgb_model": "no existe"}, frame, 1, cutoff) is None
+
+
+def test_la_receta_del_campeon_no_usa_los_pesos_del_config(module, monkeypatch):
+    """Reentrenado, el campeon mezcla con pesos walk-forward, no con los de su ultima fold."""
+
+    # `score` exige las 12 estaciones de produccion; aqui hay dos.
+    monkeypatch.setattr(module, "EXPECTED_STATION_COUNT", len(STATIONS))
+    observations = history_frame()
+    context = context_frame(observations, DAYS)
+    frame = module.add_features(observations.copy(), context.copy(), GAP_STEPS)
+    frame["target"] = frame.groupby("station_id", sort=False)["demand"].shift(-1)
+    frame = frame.dropna(subset=["target"])
+    columns = module.feature_columns_for_horizon(candidate_columns(module, frame), 15)
+    cutoff = frame["observed_at"].max() - pd.Timedelta(days=1)
+    validation = frame.loc[frame["observed_at"] > cutoff]
+    config = {
+        "hgb_model": "HGB shallow",
+        "hgb_weight": 1.0,
+        "feature_columns": columns,
+        "persistence_weights": {station: 0.5 for station in STATIONS},
+    }
+    model = module.refit_champion_recipe(config, frame, 1, cutoff)
+    bundle = {15: (model, config)}
+
+    frozen = module.champion_rows_for_horizon(bundle, "c", 1, 1, validation)
+    refit_first_fold = module.champion_rows_for_horizon(
+        bundle, "c", 1, 1, validation, model=model, persistence_weights={}
+    )
+    unblended = module.score(
+        "c", 1, 1, validation,
+        pd.Series(module.champion_base_predictions(model, config, validation, 1)),
+    )
+
+    assert [row["accuracy"] for row in refit_first_fold] == [row["accuracy"] for row in unblended]
+    assert [row["accuracy"] for row in frozen] != [row["accuracy"] for row in unblended]
