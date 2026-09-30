@@ -13,6 +13,7 @@ from scripts.infer_and_submit import (
     BIAS_FACTOR_BOUNDS,
     BIAS_MIN_SAMPLES,
     bias_factor,
+    guarded_factor,
     station_bias_factors,
 )
 
@@ -75,6 +76,47 @@ def test_la_correccion_no_mira_demanda_posterior_al_corte():
     data_cutoff = observations["observed_at"].max().floor("h") - pd.Timedelta(hours=2)
     # Despues del corte la demanda se dispara: no debe influir en el factor.
     observations.loc[observations["observed_at"] > data_cutoff, "demand"] = 1000.0
+    context = pd.DataFrame(columns=["observed_at", "rain_forecast", "temperature_forecast", "event_intensity"])
+    config = {"history_gap_steps": 0, "feature_columns": ["is_weekend"], "hgb_weight": 1.0}
+    bundle = {minutes: (Path("unused"), config) for minutes in (15, 30, 45, 60)}
+    models = {minutes: ConstantModel(100.0) for minutes in bundle}
+
+    assert station_bias_factors(["A"], data_cutoff, observations, context, bundle, models)["A"] == 1.0
+
+
+def test_la_guardia_no_corrige_contra_la_ultima_hora():
+    # Tras un pico: la ventana de 3 h pide subir, pero la ultima hora ya va de mas.
+    assert guarded_factor(1.3, 0.8) == 1.0
+    assert guarded_factor(1.3, None) == 1.0
+
+
+def test_la_guardia_aplica_el_menor_desvio_confirmado():
+    assert guarded_factor(1.3, 1.1) == pytest.approx(1.1)
+    assert guarded_factor(1.1, 1.6) == pytest.approx(1.1)
+    assert guarded_factor(0.7, 0.9) == pytest.approx(0.9)
+
+
+def test_con_un_cambio_de_nivel_sostenido_la_guardia_deja_pasar_la_correccion():
+    # El nivel real lleva horas 50 % arriba: 3 h y ultima hora coinciden.
+    observations = history({"A": 150.0})
+    context = pd.DataFrame(columns=["observed_at", "rain_forecast", "temperature_forecast", "event_intensity"])
+    data_cutoff = observations["observed_at"].max().floor("h")
+    config = {"history_gap_steps": 0, "feature_columns": ["is_weekend"], "hgb_weight": 1.0}
+    bundle = {minutes: (Path("unused"), config) for minutes in (15, 30, 45, 60)}
+    models = {minutes: ConstantModel(100.0) for minutes in bundle}
+
+    assert station_bias_factors(["A"], data_cutoff, observations, context, bundle, models)["A"] == pytest.approx(1.225)
+
+
+def test_en_la_bajada_de_un_pico_la_guardia_no_empuja_hacia_arriba():
+    observations = history({"A": 100.0})
+    data_cutoff = observations["observed_at"].max().floor("h")
+    # Pico entre 3 h y 1 h antes del corte; la ultima hora ya volvio a lo normal.
+    spike = (observations["observed_at"] > data_cutoff - pd.Timedelta(hours=3)) & (
+        observations["observed_at"] <= data_cutoff - pd.Timedelta(hours=1)
+    )
+    observations.loc[spike, "demand"] = 400.0
+    observations.loc[observations["observed_at"] > data_cutoff - pd.Timedelta(hours=1), "demand"] = 90.0
     context = pd.DataFrame(columns=["observed_at", "rain_forecast", "temperature_forecast", "event_intensity"])
     config = {"history_gap_steps": 0, "feature_columns": ["is_weekend"], "hgb_weight": 1.0}
     bundle = {minutes: (Path("unused"), config) for minutes in (15, 30, 45, 60)}

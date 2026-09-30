@@ -44,6 +44,13 @@ BIAS_ALPHA = 0.5
 BIAS_DEADZONE = 0.05
 BIAS_FACTOR_BOUNDS = (0.5, 2.0)
 BIAS_MIN_SAMPLES = 8
+# Guardia de direccion: tras un pico transitorio la ventana de 3 h sigue diciendo "sube"
+# mientras la demanda ya cae, y empujaba justo en la bajada (backtest con picos x6: 53.6 ->
+# 37.8 en la bajada). Solo se corrige si la ultima hora (h = 15 min en los 4 cuartos
+# previos) va en el mismo sentido, y como mucho lo que esa ultima hora respalda. Con la
+# guardia la bajada queda en 51.3 y la ganancia en cambios de nivel sostenidos se mantiene.
+SURPRISE_QUARTERS = 4
+SURPRISE_MIN_SAMPLES = 3
 SAMPLE_DATA_PATHS = {
     "observations": ROOT / "data" / "observations.csv",
     "context": ROOT / "data" / "context.csv",
@@ -594,6 +601,49 @@ def bias_factor(
     return min(max(1 + alpha * excess, bounds[0]), bounds[1])
 
 
+def guarded_factor(slow: float, recent: float | None) -> float:
+    """Factor de 3 h acotado por lo que confirma la ultima hora.
+
+    Si la ultima hora no alcanza para medir o va en sentido contrario, no se corrige; si
+    coincide, se aplica el menor de los dos desvios.
+    """
+
+    if recent is None or (slow - 1) * (recent - 1) <= 0:
+        return 1.0
+    return 1 + math.copysign(min(abs(slow - 1), abs(recent - 1)), slow - 1)
+
+
+def recent_surprise(
+    station_id: str,
+    data_cutoff: pd.Timestamp,
+    observations: pd.DataFrame,
+    context: pd.DataFrame,
+    model: Any,
+    config: dict[str, Any],
+    actual_by_key: dict[tuple[str, pd.Timestamp], float],
+) -> float | None:
+    """Real / predicho a 15 min en los ultimos cuartos: que tan atrasado va el campeon ahora."""
+
+    actual_sum = predicted_sum = 0.0
+    samples = 0
+    for quarters_back in range(1, SURPRISE_QUARTERS + 1):
+        past_cutoff = data_cutoff - pd.Timedelta(minutes=PERIOD_MINUTES * quarters_back)
+        target = past_cutoff + pd.Timedelta(minutes=PERIOD_MINUTES)
+        actual = actual_by_key.get((station_id, target))
+        if actual is None:
+            continue
+        try:
+            predicted = predict_value(station_id, target, past_cutoff, observations, context, model, config)
+        except (RuntimeError, ValueError, KeyError):
+            continue
+        actual_sum += actual
+        predicted_sum += max(predicted, 0.0)
+        samples += 1
+    if samples < SURPRISE_MIN_SAMPLES or predicted_sum <= 0:
+        return None
+    return actual_sum / predicted_sum
+
+
 def station_bias_factors(
     stations: Iterable[str],
     data_cutoff: pd.Timestamp,
@@ -638,7 +688,14 @@ def station_bias_factors(
                 except (RuntimeError, ValueError, KeyError):
                     continue
                 matured.append((actual, max(predicted, 0.0)))
-        factors[station_id] = bias_factor(matured)
+        slow = bias_factor(matured)
+        recent = None
+        if slow != 1.0 and PERIOD_MINUTES in bundle:
+            recent = recent_surprise(
+                station_id, data_cutoff, observations, context,
+                loaded_models[PERIOD_MINUTES], bundle[PERIOD_MINUTES][1], actual_by_key,
+            )
+        factors[station_id] = guarded_factor(slow, recent)
     return factors
 
 
