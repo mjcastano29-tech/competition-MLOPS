@@ -52,3 +52,11 @@ def test_un_campeon_viejo_se_refresca_aunque_no_haya_drift():
 def test_el_drift_ya_absorbido_no_dispara():
     # Una estacion que lleva una semana en su nivel nuevo ya esta en el entrenamiento.
     assert drift_signals(dashboard(levels=((0.3, 0.32),))) == []
+
+
+def test_la_alerta_de_wape_respeta_el_enfriamiento():
+    # Antes despachaba cada hora y por duplicado; ahora pasa por las mismas reglas.
+    assert decide(dashboard(), [run(1)], NOW, wape_alert=True)[0] is False
+    assert decide(dashboard(), [run(0.1, status="queued")], NOW, wape_alert=True)[0] is False
+    dispatch, reason = decide(dashboard(), [run(COOLDOWN_HOURS + 0.5)], NOW, wape_alert=True)
+    assert dispatch and "WAPE" in reason

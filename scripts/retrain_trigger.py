@@ -69,9 +69,17 @@ def drift_signals(dashboard: dict[str, Any]) -> list[str]:
 
 
 def decide(
-    dashboard: dict[str, Any], runs: list[dict[str, Any]], now: datetime
+    dashboard: dict[str, Any],
+    runs: list[dict[str, Any]],
+    now: datetime,
+    *,
+    wape_alert: bool = False,
 ) -> tuple[bool, str]:
-    """`(despachar, motivo)` a partir de las senales y del historial de reentrenamientos."""
+    """`(despachar, motivo)` a partir de las senales y del historial de reentrenamientos.
+
+    `wape_alert` es la alerta pendiente del monitor de WAPE: cuenta como una senal mas y
+    respeta el mismo enfriamiento (antes se despachaba aparte, cada hora y duplicada).
+    """
 
     if any(run.get("status") in {"queued", "in_progress", "waiting", "pending"} for run in runs):
         return False, "hay un reentrenamiento en curso"
@@ -81,6 +89,8 @@ def decide(
     if since_last is not None and since_last < timedelta(hours=COOLDOWN_HOURS):
         return False, f"ultimo reentrenamiento hace {since_last.total_seconds() / 3600:.1f} h (enfriamiento {COOLDOWN_HOURS:.0f} h)"
     reasons = drift_signals(dashboard)
+    if wape_alert:
+        reasons.insert(0, "alerta de WAPE pendiente")
     if reasons:
         return True, "drift: " + "; ".join(reasons[:4])
     if since_last is None or since_last >= timedelta(hours=STALE_HOURS):
@@ -105,9 +115,12 @@ def fetch_dashboard() -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=Path, required=True, help="JSON de `gh run list` del workflow de reentrenamiento.")
+    parser.add_argument("--wape-alert", default="false", help="'true' si el monitor de WAPE dejo una alerta pendiente.")
     args = parser.parse_args()
     runs = json.loads(args.runs.read_text(encoding="utf-8") or "[]")
-    dispatch, reason = decide(fetch_dashboard(), runs, datetime.now(timezone.utc))
+    dispatch, reason = decide(
+        fetch_dashboard(), runs, datetime.now(timezone.utc), wape_alert=args.wape_alert == "true"
+    )
     print(f"Reentrenar: {'si' if dispatch else 'no'} ({reason})")
     output = os.getenv("GITHUB_OUTPUT")
     if output:

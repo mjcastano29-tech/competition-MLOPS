@@ -49,19 +49,6 @@ jobs:
       - name: Find pending drift alert
         id: pending
         run: python scripts/wape_drift.py pending
-      - name: Dispatch retraining for pending drift
-        if: steps.pending.outputs.drift_pending == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl --fail-with-body --silent --show-error \
-            --request POST \
-            --url "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/retrain_on_drift.yml/dispatches" \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --header "Content-Type: application/json" \
-            --data '{"ref":"main"}'
       # El monitor de WAPE necesita dos semanas de entregas para comparar; estas senales
       # (nivel de demanda por estacion y caidas de accuracy, ancladas al reloj virtual)
       # reaccionan en horas. Tambien cubren al cron de reentrenamiento, que GitHub retrasa.
@@ -72,9 +59,10 @@ jobs:
         run: |
           gh run list --repo "$GITHUB_REPOSITORY" --workflow retrain_on_drift.yml --limit 20 \
             --json createdAt,status,conclusion,event > retrain_runs.json
-          python scripts/retrain_trigger.py --runs retrain_runs.json
+          python scripts/retrain_trigger.py --runs retrain_runs.json \
+            --wape-alert "${{ steps.pending.outputs.drift_pending }}"
       - name: Dispatch retraining for drift signals or a stale champion
-        if: steps.trigger.outputs.dispatch == 'true' && steps.pending.outputs.drift_pending != 'true'
+        if: steps.trigger.outputs.dispatch == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
