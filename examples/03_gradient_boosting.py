@@ -15,6 +15,22 @@ import mlflow
 import mlflow.sklearn
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+try:
+    from scripts.ar_baseline import (
+        apply_ar_weights,
+        ar2_station_forecast,
+        build_normal_profile,
+        choose_ar_weights,
+    )
+except ImportError:  # ejecutado como `python examples/03_gradient_boosting.py`
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts.ar_baseline import (
+        apply_ar_weights,
+        ar2_station_forecast,
+        build_normal_profile,
+        choose_ar_weights,
+    )
+
 
 TARGET = "demand"
 PERIOD_MINUTES = 15
@@ -71,6 +87,9 @@ VALIDATION_WINDOW_REPORT = Path("reports/validation_window.json")
 PERSISTENCE_COLUMN = "visible_lag_0"
 PERSISTENCE_WEIGHT_GRID = tuple(round(0.05 * step, 2) for step in range(11))
 PERSISTENCE_WEIGHTS_REPORT = Path("reports/persistence_weights.json")
+# Mezcla final con el AR(2) local de scripts/ar_baseline.py: peso por estacion elegido en
+# la fold anterior, igual que la persistencia; en estaciones donde el AR no sirve queda 0.
+AR_WEIGHTS_REPORT = Path("reports/ar_weights.json")
 
 MODEL_CONFIGS = {
     "HGB baseline": {
@@ -628,6 +647,38 @@ def champion_base_predictions(
     ) * weekly_baseline
 
 
+def ar_forecast_table(
+    observations: pd.DataFrame, profile: dict[str, Any], cutoffs: pd.DatetimeIndex
+) -> dict[tuple[str, pd.Timestamp], np.ndarray]:
+    """Pronostico AR(2) de 4 pasos por estacion y corte, para los cortes de validacion."""
+
+    frame = observations.copy()
+    frame["observed_at"] = pd.to_datetime(frame["observed_at"], utc=True)
+    table: dict[tuple[str, pd.Timestamp], np.ndarray] = {}
+    for station_id, block in frame.groupby("station_id"):
+        series = block.set_index("observed_at")["demand"].astype(float).sort_index()
+        for cutoff in cutoffs:
+            forecast = ar2_station_forecast(series, cutoff, profile, str(station_id))
+            if forecast is not None:
+                table[(str(station_id), pd.Timestamp(cutoff))] = forecast
+    return table
+
+
+def ar_values_for(
+    validation: pd.DataFrame, horizon: int, table: dict[tuple[str, pd.Timestamp], np.ndarray]
+) -> np.ndarray:
+    """Columna AR para las filas de validacion de un horizonte (NaN si no hay pronostico)."""
+
+    out = np.full(len(validation), np.nan)
+    for position, (station_id, cutoff) in enumerate(
+        zip(validation["station_id"].astype(str), pd.to_datetime(validation["observed_at"], utc=True))
+    ):
+        forecast = table.get((station_id, pd.Timestamp(cutoff)))
+        if forecast is not None:
+            out[position] = forecast[horizon - 1]
+    return out
+
+
 def champion_rows_for_horizon(
     bundle: dict[int, tuple[Any, dict[str, Any]]],
     label: str,
@@ -636,6 +687,8 @@ def champion_rows_for_horizon(
     validation: pd.DataFrame,
     model: Any | None = None,
     persistence_weights: dict[str, float] | None = None,
+    ar_values: np.ndarray | None = None,
+    ar_weights: dict[str, float] | None = None,
 ) -> list[dict[str, object]]:
     """Puntua al campeon sobre la MISMA fold del candidato: comparacion emparejada.
 
@@ -655,6 +708,13 @@ def champion_rows_for_horizon(
         validation["station_id"].to_numpy(),
         config.get("persistence_weights") if model is None else persistence_weights,
     )
+    if ar_values is not None:
+        predictions = apply_ar_weights(
+            predictions,
+            ar_values,
+            validation["station_id"].to_numpy(),
+            config.get("ar_weights") if model is None else ar_weights,
+        )
     return score(label, fold, horizon, validation, pd.Series(predictions))
 
 
@@ -763,6 +823,7 @@ def save_best_models(
     ensemble_metrics: pd.DataFrame,
     parent_run_id: str,
     persistence_weights: dict[str, dict[str, dict[str, float]]] | None = None,
+    ar_weights: dict[str, dict[str, dict[str, float]]] | None = None,
 ) -> None:
     BEST_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     for horizon_minutes, ensemble_name in best_model_names.items():
@@ -801,6 +862,7 @@ def save_best_models(
                     "persistence_weights": (persistence_weights or {})
                     .get(str(horizon_minutes), {})
                     .get(ensemble_name, {}),
+                    "ar_weights": (ar_weights or {}).get(str(horizon_minutes), {}).get(ensemble_name, {}),
                     "station_count": EXPECTED_STATION_COUNT,
                     "feature_columns": horizon_feature_columns,
                     "training_rows": len(horizon_frame),
@@ -905,6 +967,13 @@ def run_experiment(
     # Pesos de persistencia de cada ensemble elegidos en la ultima fold: los que empaqueta
     # 04_package_best_model.py para la inferencia.
     persistence_weights: dict[str, dict[str, dict[str, float]]] = {}
+    ar_weights: dict[str, dict[str, dict[str, float]]] = {}
+    profile = build_normal_profile(observations)
+    window_cutoffs = pd.DatetimeIndex(
+        sorted(frame.loc[(frame["observed_at"] >= anchor) & (frame["observed_at"] < fold_windows[len(fold_starts)][1]), "observed_at"].unique())
+    )
+    ar_table = ar_forecast_table(observations, profile, window_cutoffs)
+    print(f"AR(2) local: {len(ar_table)} pronosticos para {len(window_cutoffs)} cortes de validacion.")
 
     for horizon in HORIZONS:
         horizon_frame = frame.copy()
@@ -914,7 +983,9 @@ def run_experiment(
         # Pesos de persistencia de la fold anterior por ensemble; la primera fold va sin
         # mezcla, porque elegirlos sobre la misma fold que se puntua seria hacer trampa.
         previous_weights: dict[str, dict[str, float]] = {}
+        previous_ar_weights: dict[str, dict[str, float]] = {}
         champion_previous_weights: dict[str, float] = {}
+        champion_previous_ar_weights: dict[str, float] = {}
         for fold, validation_start in enumerate(fold_starts, start=1):
             validation_end = validation_start + timedelta(days=VALIDATION_FOLD_DAYS)
             # Leave a horizon-sized embargo so training labels cannot overlap validation.
@@ -987,6 +1058,7 @@ def run_experiment(
                 champion_validation = align_champion_validation(
                     frames_by_gap[champion_gap], validation, horizon
                 )
+                champion_ar = ar_values_for(champion_validation, horizon, ar_table)
                 incumbent_rows = champion_rows_for_horizon(
                     champion_bundle,
                     str(champion_label),
@@ -995,16 +1067,32 @@ def run_experiment(
                     champion_validation,
                     model=refit_model,
                     persistence_weights=champion_previous_weights,
+                    ar_values=champion_ar,
+                    ar_weights=champion_previous_ar_weights,
                 )
                 if refit_model is not None:
                     # Mismo walk-forward que el candidato: estos pesos valen para la
                     # siguiente fold, nunca para la que acaba de puntuarse.
-                    champion_previous_weights = choose_persistence_weights(
-                        champion_validation["station_id"].to_numpy(),
+                    champion_base = champion_base_predictions(
+                        refit_model, champion_config, champion_validation, horizon
+                    )
+                    champion_stations = champion_validation["station_id"].to_numpy()
+                    champion_blended = apply_persistence_weights(
+                        champion_base,
+                        champion_validation[PERSISTENCE_COLUMN].to_numpy(),
+                        champion_stations,
+                        champion_previous_weights,
+                    )
+                    champion_previous_ar_weights = choose_ar_weights(
+                        champion_stations,
                         champion_validation["target"].to_numpy(),
-                        champion_base_predictions(
-                            refit_model, champion_config, champion_validation, horizon
-                        ),
+                        champion_blended,
+                        champion_ar,
+                    )
+                    champion_previous_weights = choose_persistence_weights(
+                        champion_stations,
+                        champion_validation["target"].to_numpy(),
+                        champion_base,
                         champion_validation[PERSISTENCE_COLUMN].to_numpy(),
                     )
                 metric_rows.extend(incumbent_rows)
@@ -1048,7 +1136,9 @@ def run_experiment(
             weekly_baseline = validation[f"demand_lag_{672 - horizon}"].to_numpy()
             persistence = validation[PERSISTENCE_COLUMN].to_numpy()
             station_ids = validation["station_id"].to_numpy()
+            ar_values = ar_values_for(validation, horizon, ar_table)
             fold_weights: dict[str, dict[str, float]] = {}
+            fold_ar_weights: dict[str, dict[str, float]] = {}
             for model_name, predictions in hgb_predictions.items():
                 for hgb_weight in ENSEMBLE_WEIGHTS:
                     ensemble_name = f"Ensemble {model_name} + Seasonal Naive 7d ({hgb_weight:.1f})"
@@ -1068,6 +1158,18 @@ def run_experiment(
                         station_ids,
                         previous_weights.get(ensemble_name),
                     )
+                    fold_ar_weights[ensemble_name] = choose_ar_weights(
+                        station_ids,
+                        validation["target"].to_numpy(),
+                        ensemble_predictions,
+                        ar_values,
+                    )
+                    ensemble_predictions = apply_ar_weights(
+                        ensemble_predictions,
+                        ar_values,
+                        station_ids,
+                        previous_ar_weights.get(ensemble_name),
+                    )
                     ensemble_rows = score(
                         ensemble_name,
                         fold,
@@ -1085,7 +1187,9 @@ def run_experiment(
                         mlflow.log_param("hgb_weight", hgb_weight)
                         mlflow.set_tag("ensemble", "HistGradientBoosting + Seasonal Naive 7d")
             previous_weights = fold_weights
+            previous_ar_weights = fold_ar_weights
         persistence_weights[str(horizon * 15)] = previous_weights
+        ar_weights[str(horizon * 15)] = previous_ar_weights
 
     metrics = pd.DataFrame(metric_rows)
     # `validation_start/end` es la VENTANA COMPLETA de evaluacion (la union de
@@ -1149,6 +1253,8 @@ def run_experiment(
         json.dumps(persistence_weights, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     mlflow.log_artifact(str(PERSISTENCE_WEIGHTS_REPORT), artifact_path="validation")
+    AR_WEIGHTS_REPORT.write_text(json.dumps(ar_weights, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    mlflow.log_artifact(str(AR_WEIGHTS_REPORT), artifact_path="validation")
     mlflow.log_artifact(str(report_path), artifact_path="validation")
     ensemble_metrics = metrics[metrics["model"].str.startswith("Ensemble ")]
     ensemble_summary = (
@@ -1180,6 +1286,7 @@ def run_experiment(
         ensemble_metrics,
         parent_run_id,
         persistence_weights,
+        ar_weights,
     )
     summary = (
         metrics.groupby(["horizon_minutes", "model"], as_index=False)["accuracy"]

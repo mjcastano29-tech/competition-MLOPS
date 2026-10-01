@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.ar_baseline import build_normal_profile, save_profile  # noqa: E402
 from scripts.infer_and_submit import unsupported_feature_columns  # noqa: E402
 from scripts.model_gate import (  # noqa: E402
     CANDIDATE_SOURCE,
@@ -34,6 +35,7 @@ from scripts.model_gate import (  # noqa: E402
 REPORT_PATH = ROOT / "reports/ml_validation_metrics.csv"
 WINDOW_REPORT_PATH = ROOT / "reports/validation_window.json"
 PERSISTENCE_WEIGHTS_PATH = ROOT / "reports/persistence_weights.json"
+AR_WEIGHTS_PATH = ROOT / "reports/ar_weights.json"
 PACKAGE_DIR = ROOT / "artifacts/pulso_transmi_best_models"
 PACKAGE_PATH = ROOT / "artifacts/pulso_transmi_best_models.zip"
 PROMOTION_INPUTS_PATH = PACKAGE_DIR / "promotion_inputs.json"
@@ -284,6 +286,7 @@ def main() -> None:
         if PERSISTENCE_WEIGHTS_PATH.exists()
         else {}
     )
+    ar_weights = json.loads(AR_WEIGHTS_PATH.read_text(encoding="utf-8")) if AR_WEIGHTS_PATH.exists() else {}
     # Se entrena y empaqueta sobre el snapshot versionado (data/snapshot.json) para
     # que el hash de filas del manifiesto coincida con el de las metricas.
     observations, context, snapshot = module.load_dataset_frames()
@@ -345,6 +348,7 @@ def main() -> None:
                 "persistence_weights": persistence_weights.get(str(int(horizon_minutes)), {}).get(
                     ensemble_name, {}
                 ),
+                "ar_weights": ar_weights.get(str(int(horizon_minutes)), {}).get(ensemble_name, {}),
                 "recency_half_life_days": module.RECENCY_HALF_LIFE_DAYS,
                 "validation_start": window_report.get("validation_start"),
                 "validation_end": window_report.get("validation_end"),
@@ -375,8 +379,12 @@ def main() -> None:
         PROMOTION_INPUTS_PATH.write_text(
             json.dumps(inputs, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        # Perfil normal para el AR(2) de la inferencia: viaja con el paquete, asi la mezcla
+        # no depende de que la inferencia descargue los primeros 28 dias de historia.
+        profile_path = save_profile(build_normal_profile(observations), PACKAGE_DIR)
         files = [
             *model_files,
+            profile_path,
             PACKAGE_DIR / "wape_by_station.csv",
             PACKAGE_DIR / "best_ensemble_summary.csv",
             PROMOTION_INPUTS_PATH,

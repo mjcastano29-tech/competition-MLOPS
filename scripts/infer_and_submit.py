@@ -17,6 +17,11 @@ import httpx
 import numpy as np
 import pandas as pd
 
+try:
+    from scripts.ar_baseline import ar2_station_forecast, load_profile
+except ImportError:  # ejecutado como `python scripts/infer_and_submit.py`
+    from ar_baseline import ar2_station_forecast, load_profile
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_API_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
 BUNDLE_DIR = ROOT / "artifacts" / "pulso_transmi_best_models"
@@ -896,6 +901,28 @@ def infer_predictions_with_report(
             factors = {}
             print(f"Aviso: correccion de sesgo desactivada en este ciclo ({exc}).")
 
+    # AR(2) local por estacion (scripts/ar_baseline.py), mezclado con el peso por estacion
+    # que el entrenamiento eligio en validacion. Sin perfil en el paquete o sin datos
+    # suficientes no se mezcla: la prediccion del campeon queda tal cual.
+    ar_forecasts: dict[str, np.ndarray] = {}
+    if loaded_models:
+        try:
+            profile = load_profile(next(iter(bundle.values()))[0].parent.parent)
+            if profile is not None:
+                for station_id in sorted(target_stations):
+                    series = (
+                        observations.loc[observations["station_id"] == station_id]
+                        .set_index("observed_at")["demand"].astype(float).sort_index()
+                    )
+                    series = series[~series.index.duplicated(keep="last")]
+                    forecast = ar2_station_forecast(series, data_cutoff, profile, station_id)
+                    if forecast is not None:
+                        ar_forecasts[station_id] = forecast
+        except Exception as exc:  # el AR nunca debe costar un ciclo
+            ar_forecasts = {}
+            print(f"Aviso: mezcla AR desactivada en este ciclo ({exc}).")
+    ar_mixed: set[str] = set()
+
     predictions: list[dict[str, Any]] = []
     sources: list[str] = []
     failures: dict[str, int] = {}
@@ -911,6 +938,11 @@ def infer_predictions_with_report(
                     station_id, target_at, data_cutoff, observations, context,
                     loaded_models[horizon_minutes], bundle[horizon_minutes][1],
                 ) * factors.get(station_id, 1.0)
+                ar_weight = float((bundle[horizon_minutes][1].get("ar_weights") or {}).get(station_id, 0.0))
+                step = horizon_minutes // PERIOD_MINUTES
+                if ar_weight > 0 and station_id in ar_forecasts and 1 <= step <= len(ar_forecasts[station_id]):
+                    candidate = (1 - ar_weight) * candidate + ar_weight * float(ar_forecasts[station_id][step - 1])
+                    ar_mixed.add(station_id)
                 if plausible(candidate, station_id, data_cutoff, observations):
                     value = candidate
                 else:
@@ -946,6 +978,9 @@ def infer_predictions_with_report(
         report["reasons"].append(
             f"el campeon fallo en {report['fallback_targets']} targets: {failures or 'sin detalle'}"
         )
+    report["ar_mixed_stations"] = sorted(ar_mixed)
+    if ar_mixed:
+        print(f"Mezcla AR(2) aplicada en {len(ar_mixed)} estaciones: {sorted(ar_mixed)}")
     print(
         f"Fuentes de prediccion: {counts} · compatible={report['compatible']}"
         + (f" · fallas del campeon {failures}" if failures else "")
