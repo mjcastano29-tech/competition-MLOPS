@@ -1,0 +1,28 @@
+name: alert-email-test
+
+# Prueba manual del canal de alertas: abre (y cierra) un issue creado por el bot
+# github-actions, igual que la alerta real de datos incompatibles de forecast_cycle.yml.
+# Si llega el correo de este issue, llegara el de la alerta real. Usa otra etiqueta para
+# no bloquear la alerta real, que no abre un issue nuevo si ya hay uno abierto con la suya.
+on:
+  workflow_dispatch:
+
+jobs:
+  send-test-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open and close a test alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create prueba-alerta --repo "$GITHUB_REPOSITORY" --color c5def5 \
+            --description "Prueba del canal de alertas por correo" 2>/dev/null || true
+          url=$(gh issue create --repo "$GITHUB_REPOSITORY" --label prueba-alerta \
+            --title "[PRUEBA] Canal de alertas de datos incompatibles" \
+            --body "Prueba del canal de alertas. Si este aviso te llego por correo, la alerta real de **datos incompatibles con el modelo** tambien te llegara. No requiere ninguna accion. Run: $RUN_URL")
+          echo "Issue de prueba: $url" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh issue close "$url" --repo "$GITHUB_REPOSITORY" --comment "Prueba completada; se cierra automaticamente."
