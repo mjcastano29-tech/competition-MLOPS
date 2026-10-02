@@ -19,9 +19,11 @@ import pandas as pd
 
 try:
     from scripts.ar_baseline import ar2_station_forecast, load_profile
+    from scripts.leader_model import leader_forecasts
     from scripts.relative_model import RelativeBlend, relative_model_path
 except ImportError:  # ejecutado como `python scripts/infer_and_submit.py`
     from ar_baseline import ar2_station_forecast, load_profile
+    from leader_model import leader_forecasts
     from relative_model import RelativeBlend, relative_model_path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -932,6 +934,21 @@ def infer_predictions_with_report(
             print(f"Aviso: mezcla AR desactivada en este ciclo ({exc}).")
     ar_mixed: set[str] = set()
 
+    # Regimen de ondas: cada estacion copia a otra con 1-4 h de desfase (scripts/leader_model.py).
+    # Solo para estaciones que pasan la compuerta doble; el resto sigue con el campeon.
+    leaders: dict[str, dict[str, Any]] = {}
+    if os.getenv("LEADER_MODEL", "on").lower() not in {"off", "0", "false"}:
+        try:
+            leaders = leader_forecasts(observations, data_cutoff, target_stations)
+            if leaders:
+                print("Estacion lider activa: " + ", ".join(
+                    f"{s}<-{v['leader']} {v['lag_quarters'] * PERIOD_MINUTES}min (corr {v['corr']:.3f}, prueba {v['holdout_accuracy']:.0%})"
+                    for s, v in sorted(leaders.items())
+                ))
+        except Exception as exc:  # nunca debe costar un ciclo
+            leaders = {}
+            print(f"Aviso: estacion lider desactivada en este ciclo ({exc}).")
+
     predictions: list[dict[str, Any]] = []
     sources: list[str] = []
     failures: dict[str, int] = {}
@@ -941,7 +958,12 @@ def infer_predictions_with_report(
         horizon_minutes = int((target_at - data_cutoff).total_seconds() // 60)
         value: float | None = None
         source = "campeon"
-        if horizon_minutes in loaded_models and (known is None or station_id in known):
+        step = horizon_minutes // PERIOD_MINUTES
+        if station_id in leaders and 1 <= step <= len(leaders[station_id]["forecast"]):
+            candidate = float(leaders[station_id]["forecast"][step - 1])
+            if plausible(candidate, station_id, data_cutoff, observations):
+                value, source = candidate, "lider"
+        if value is None and horizon_minutes in loaded_models and (known is None or station_id in known):
             try:
                 candidate = predict_value(
                     station_id, target_at, data_cutoff, observations, context,
@@ -973,10 +995,12 @@ def infer_predictions_with_report(
         item["value"] = round(max(float(item["value"]), 0.0), 4)
 
     counts = {name: sources.count(name) for name in dict.fromkeys(sources)}
+    modeled = counts.get("campeon", 0) + counts.get("lider", 0)
+    report["leader_stations"] = sorted(leaders)
     report.update({
         "total_targets": len(predictions),
-        "champion_targets": counts.get("campeon", 0),
-        "fallback_targets": len(predictions) - counts.get("campeon", 0),
+        "champion_targets": modeled,
+        "fallback_targets": len(predictions) - modeled,
         "sources": counts,
         "champion_failures": failures,
     })
