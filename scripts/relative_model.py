@@ -25,6 +25,11 @@ RELATIVE_SUFFIX = " + Relativo"
 # Solo la configuracion validada en el backtest: cada configuracion relativa suma ~6 min
 # al reentrenamiento, y con dos el job rozaba su limite.
 RELATIVE_CONFIGS = ("HGB more leaves",)
+# Variante con memoria corta del mismo candidato. Backtest: en el regimen de ondas +0.98
+# pts y ninguna estacion peor; en dias sin quiebre -0.43. Como candidato, la compuerta la
+# adopta sola cuando la ventana de validacion se llena de dias con drift.
+MEMORY_SUFFIX = " + Memoria 1d"
+SHORT_HALF_LIFE_DAYS = 1.0
 
 
 def relative_target(target: pd.Series | np.ndarray, reference: pd.Series | np.ndarray) -> np.ndarray:
@@ -44,6 +49,19 @@ def split_candidate_name(model_name: str) -> tuple[str, bool]:
     if model_name.endswith(RELATIVE_SUFFIX):
         return model_name[: -len(RELATIVE_SUFFIX)], True
     return model_name, False
+
+
+def parse_candidate(model_name: str) -> tuple[str, bool, float | None]:
+    """`("HGB more leaves", True, 1.0)` para "HGB more leaves + Relativo + Memoria 1d".
+
+    La vida media es None cuando el candidato usa la de la configuracion por defecto.
+    """
+
+    half_life = None
+    if model_name.endswith(MEMORY_SUFFIX):
+        model_name, half_life = model_name[: -len(MEMORY_SUFFIX)], SHORT_HALF_LIFE_DAYS
+    base, relative = split_candidate_name(model_name)
+    return base, relative, half_life
 
 
 class RelativeBlend:

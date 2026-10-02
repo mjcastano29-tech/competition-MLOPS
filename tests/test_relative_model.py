@@ -90,3 +90,11 @@ def test_el_paquete_con_arboles_relativos_carga_un_modelo_por_horizonte(tmp_path
     bundle = inf.ensure_bundle_ready()
     assert sorted(bundle) == [15, 30]
     assert all(path.name.endswith("_hgb.pkl") for path, _ in bundle.values())
+
+
+def test_el_candidato_de_memoria_corta_se_reconoce():
+    from scripts.relative_model import SHORT_HALF_LIFE_DAYS, parse_candidate
+
+    assert parse_candidate("HGB more leaves + Relativo + Memoria 1d") == ("HGB more leaves", True, SHORT_HALF_LIFE_DAYS)
+    assert parse_candidate("HGB more leaves + Relativo") == ("HGB more leaves", True, None)
+    assert parse_candidate("HGB shallow") == ("HGB shallow", False, None)

@@ -26,7 +26,7 @@ from scripts.relative_model import (  # noqa: E402
     RELATIVE_REFERENCE,
     RELATIVE_WEIGHT,
     relative_model_path,
-    split_candidate_name,
+    parse_candidate,
 )
 from scripts.infer_and_submit import unsupported_feature_columns  # noqa: E402
 from scripts.model_gate import (  # noqa: E402
@@ -328,9 +328,10 @@ def main() -> None:
                 model_files.extend(retained)
                 mlflow.log_param(f"h{horizon_minutes}_source", CHAMPION_SOURCE)
                 continue
-            model_name, is_relative = split_candidate_name(
+            model_name, is_relative, candidate_half_life = parse_candidate(
                 ensemble_name.split(" + Seasonal Naive 7d", 1)[0].replace("Ensemble ", "")
             )
+            half_life = candidate_half_life or module.RECENCY_HALF_LIFE_DAYS
             hgb_weight = float(ensemble_name.rsplit("(", 1)[1].rstrip(")"))
             horizon = horizon_minutes // 15
             horizon_frame = frame.copy()
@@ -345,7 +346,7 @@ def main() -> None:
             model.fit(
                 horizon_frame[horizon_feature_columns],
                 horizon_frame["target"],
-                sample_weight=module.station_balanced_weights(horizon_frame),
+                sample_weight=module.station_balanced_weights(horizon_frame, half_life_days=half_life),
             )
 
             model_path = PACKAGE_DIR / "models" / f"horizon_{horizon_minutes}_hgb.pkl"
@@ -354,7 +355,7 @@ def main() -> None:
             relative_fields: dict = {}
             if is_relative:
                 relative = module.fit_relative_model(
-                    module.MODEL_CONFIGS[model_name], horizon_frame, horizon_feature_columns
+                    module.MODEL_CONFIGS[model_name], horizon_frame, horizon_feature_columns, half_life
                 )
                 relative_path = relative_model_path(model_path)
                 with relative_path.open("wb") as output:
@@ -382,7 +383,7 @@ def main() -> None:
                     ensemble_name, {}
                 ),
                 "ar_weights": ar_weights.get(str(int(horizon_minutes)), {}).get(ensemble_name, {}),
-                "recency_half_life_days": module.RECENCY_HALF_LIFE_DAYS,
+                "recency_half_life_days": half_life,
                 "validation_start": window_report.get("validation_start"),
                 "validation_end": window_report.get("validation_end"),
                 "dataset_name": snapshot.get("dataset_name"),

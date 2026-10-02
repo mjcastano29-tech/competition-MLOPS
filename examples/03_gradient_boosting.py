@@ -28,8 +28,11 @@ try:
         RELATIVE_REFERENCE,
         RELATIVE_SUFFIX,
         RELATIVE_WEIGHT,
+        MEMORY_SUFFIX,
+        SHORT_HALF_LIFE_DAYS,
         RelativeBlend,
         from_relative,
+        parse_candidate,
         relative_model_path,
         relative_target,
         split_candidate_name,
@@ -48,8 +51,11 @@ except ImportError:  # ejecutado como `python examples/03_gradient_boosting.py`
         RELATIVE_REFERENCE,
         RELATIVE_SUFFIX,
         RELATIVE_WEIGHT,
+        MEMORY_SUFFIX,
+        SHORT_HALF_LIFE_DAYS,
         RelativeBlend,
         from_relative,
+        parse_candidate,
         relative_model_path,
         relative_target,
         split_candidate_name,
@@ -623,7 +629,10 @@ def champion_saw_fold(champion_manifest: dict[str, Any], validation_start: pd.Ti
 
 
 def fit_relative_model(
-    model_config: dict[str, Any], train: pd.DataFrame, feature_columns: list[str]
+    model_config: dict[str, Any],
+    train: pd.DataFrame,
+    feature_columns: list[str],
+    half_life_days: float = RECENCY_HALF_LIFE_DAYS,
 ) -> HistGradientBoostingRegressor:
     """Arbol del candidato relativo: mismo modelo y pesos, target log-razon contra el corte."""
 
@@ -631,7 +640,7 @@ def fit_relative_model(
     model.fit(
         train[feature_columns],
         relative_target(train["target"], train[RELATIVE_REFERENCE]),
-        sample_weight=station_balanced_weights(train),
+        sample_weight=station_balanced_weights(train, half_life_days=half_life_days),
     )
     return model
 
@@ -665,7 +674,12 @@ def refit_champion_recipe(
         ),
     )
     if config.get("relative_weight"):
-        relative = fit_relative_model(model_config, train, list(config["feature_columns"]))
+        relative = fit_relative_model(
+            model_config,
+            train,
+            list(config["feature_columns"]),
+            float(config.get("recency_half_life_days") or RECENCY_HALF_LIFE_DAYS),
+        )
         return RelativeBlend(model, relative, float(config["relative_weight"]))
     return model
 
@@ -872,9 +886,10 @@ def save_best_models(
 ) -> None:
     BEST_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     for horizon_minutes, ensemble_name in best_model_names.items():
-        model_name, is_relative = split_candidate_name(
+        model_name, is_relative, candidate_half_life = parse_candidate(
             ensemble_name.split(" + Seasonal Naive 7d", 1)[0].replace("Ensemble ", "")
         )
+        half_life = candidate_half_life or RECENCY_HALF_LIFE_DAYS
         hgb_weight = float(ensemble_name.rsplit("(", 1)[1].rstrip(")"))
         horizon = horizon_minutes // 15
         horizon_frame = frame.copy()
@@ -889,7 +904,7 @@ def save_best_models(
         model.fit(
             horizon_frame[horizon_feature_columns],
             horizon_frame["target"],
-            sample_weight=station_balanced_weights(horizon_frame),
+            sample_weight=station_balanced_weights(horizon_frame, half_life_days=half_life),
         )
         model_path = BEST_MODEL_DIR / f"horizon_{horizon_minutes}_hgb.pkl"
         config_path = BEST_MODEL_DIR / f"horizon_{horizon_minutes}_ensemble.json"
@@ -897,7 +912,9 @@ def save_best_models(
             pickle.dump(model, output)
         relative_fields: dict[str, Any] = {}
         if is_relative:
-            relative = fit_relative_model(MODEL_CONFIGS[model_name], horizon_frame, horizon_feature_columns)
+            relative = fit_relative_model(
+                MODEL_CONFIGS[model_name], horizon_frame, horizon_feature_columns, half_life
+            )
             with relative_model_path(model_path).open("wb") as output:
                 pickle.dump(relative, output)
             relative_fields = {
@@ -909,6 +926,7 @@ def save_best_models(
             json.dumps(
                 {
                     **relative_fields,
+                    "recency_half_life_days": half_life,
                     "horizon_minutes": horizon_minutes,
                     "hgb_model": model_name,
                     "hgb_weight": hgb_weight,
@@ -1189,6 +1207,24 @@ def run_experiment(
                         hgb_predictions[f"{model_name}{RELATIVE_SUFFIX}"] = pd.Series(
                             (1 - RELATIVE_WEIGHT) * predictions.to_numpy()
                             + RELATIVE_WEIGHT * relative_predictions
+                        )
+                        # Misma receta con memoria corta: candidata para regimenes que cambian.
+                        short_level = HistGradientBoostingRegressor(
+                            **model_config, early_stopping=False, random_state=42
+                        ).fit(
+                            train[horizon_feature_columns],
+                            train["target"],
+                            sample_weight=station_balanced_weights(train, half_life_days=SHORT_HALF_LIFE_DAYS),
+                        )
+                        short_relative = fit_relative_model(
+                            model_config, train, horizon_feature_columns, SHORT_HALF_LIFE_DAYS
+                        )
+                        hgb_predictions[f"{model_name}{RELATIVE_SUFFIX}{MEMORY_SUFFIX}"] = pd.Series(
+                            (1 - RELATIVE_WEIGHT) * short_level.predict(validation[horizon_feature_columns])
+                            + RELATIVE_WEIGHT * from_relative(
+                                short_relative.predict(validation[horizon_feature_columns]),
+                                validation[RELATIVE_REFERENCE].to_numpy(),
+                            )
                         )
                     rows = score(model_name, fold, horizon, validation, predictions)
                     metric_rows.extend(rows)
