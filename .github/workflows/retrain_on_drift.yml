@@ -20,7 +20,8 @@ concurrency:
 jobs:
   evaluate-and-retrain:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # ~25-35 min con AR y candidato relativo; margen para runners lentos.
+    timeout-minutes: 75
     permissions:
       contents: read
       # Permite recuperar el ultimo paquete promoted cuando el cache del runner llega vacio.

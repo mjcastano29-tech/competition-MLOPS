@@ -22,6 +22,18 @@ try:
         build_normal_profile,
         choose_ar_weights,
     )
+    from scripts.relative_model import (
+        RELATIVE_CONFIGS,
+        RELATIVE_OFFSET,
+        RELATIVE_REFERENCE,
+        RELATIVE_SUFFIX,
+        RELATIVE_WEIGHT,
+        RelativeBlend,
+        from_relative,
+        relative_model_path,
+        relative_target,
+        split_candidate_name,
+    )
 except ImportError:  # ejecutado como `python examples/03_gradient_boosting.py`
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from scripts.ar_baseline import (
@@ -29,6 +41,18 @@ except ImportError:  # ejecutado como `python examples/03_gradient_boosting.py`
         ar2_station_forecast,
         build_normal_profile,
         choose_ar_weights,
+    )
+    from scripts.relative_model import (
+        RELATIVE_CONFIGS,
+        RELATIVE_OFFSET,
+        RELATIVE_REFERENCE,
+        RELATIVE_SUFFIX,
+        RELATIVE_WEIGHT,
+        RelativeBlend,
+        from_relative,
+        relative_model_path,
+        relative_target,
+        split_candidate_name,
     )
 
 
@@ -519,7 +543,11 @@ def load_champion_bundle(
             if not model_path.exists():
                 continue
             with model_path.open("rb") as stream:
-                bundle[horizon_minutes] = (pickle.load(stream), config)
+                model = pickle.load(stream)
+            if config.get("relative_weight"):
+                with relative_model_path(model_path).open("rb") as stream:
+                    model = RelativeBlend(model, pickle.load(stream), float(config["relative_weight"]))
+            bundle[horizon_minutes] = (model, config)
         if bundle:
             break
     if not bundle:
@@ -594,6 +622,20 @@ def champion_saw_fold(champion_manifest: dict[str, Any], validation_start: pd.Ti
     return end >= validation_start
 
 
+def fit_relative_model(
+    model_config: dict[str, Any], train: pd.DataFrame, feature_columns: list[str]
+) -> HistGradientBoostingRegressor:
+    """Arbol del candidato relativo: mismo modelo y pesos, target log-razon contra el corte."""
+
+    model = HistGradientBoostingRegressor(**model_config, early_stopping=False, random_state=42)
+    model.fit(
+        train[feature_columns],
+        relative_target(train["target"], train[RELATIVE_REFERENCE]),
+        sample_weight=station_balanced_weights(train),
+    )
+    return model
+
+
 def refit_champion_recipe(
     config: dict[str, Any],
     champion_frame: pd.DataFrame,
@@ -622,6 +664,9 @@ def refit_champion_recipe(
             half_life_days=float(config.get("recency_half_life_days") or RECENCY_HALF_LIFE_DAYS),
         ),
     )
+    if config.get("relative_weight"):
+        relative = fit_relative_model(model_config, train, list(config["feature_columns"]))
+        return RelativeBlend(model, relative, float(config["relative_weight"]))
     return model
 
 
@@ -827,7 +872,9 @@ def save_best_models(
 ) -> None:
     BEST_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     for horizon_minutes, ensemble_name in best_model_names.items():
-        model_name = ensemble_name.split(" + Seasonal Naive 7d", 1)[0].replace("Ensemble ", "")
+        model_name, is_relative = split_candidate_name(
+            ensemble_name.split(" + Seasonal Naive 7d", 1)[0].replace("Ensemble ", "")
+        )
         hgb_weight = float(ensemble_name.rsplit("(", 1)[1].rstrip(")"))
         horizon = horizon_minutes // 15
         horizon_frame = frame.copy()
@@ -848,9 +895,20 @@ def save_best_models(
         config_path = BEST_MODEL_DIR / f"horizon_{horizon_minutes}_ensemble.json"
         with model_path.open("wb") as output:
             pickle.dump(model, output)
+        relative_fields: dict[str, Any] = {}
+        if is_relative:
+            relative = fit_relative_model(MODEL_CONFIGS[model_name], horizon_frame, horizon_feature_columns)
+            with relative_model_path(model_path).open("wb") as output:
+                pickle.dump(relative, output)
+            relative_fields = {
+                "relative_weight": RELATIVE_WEIGHT,
+                "relative_offset": RELATIVE_OFFSET,
+                "relative_reference": RELATIVE_REFERENCE,
+            }
         config_path.write_text(
             json.dumps(
                 {
+                    **relative_fields,
                     "horizon_minutes": horizon_minutes,
                     "hgb_model": model_name,
                     "hgb_weight": hgb_weight,
@@ -1122,6 +1180,16 @@ def run_experiment(
                     )
                     predictions = pd.Series(model.predict(validation[horizon_feature_columns]))
                     hgb_predictions[model_name] = predictions
+                    if model_name in RELATIVE_CONFIGS:
+                        relative = fit_relative_model(model_config, train, horizon_feature_columns)
+                        relative_predictions = from_relative(
+                            relative.predict(validation[horizon_feature_columns]),
+                            validation[RELATIVE_REFERENCE].to_numpy(),
+                        )
+                        hgb_predictions[f"{model_name}{RELATIVE_SUFFIX}"] = pd.Series(
+                            (1 - RELATIVE_WEIGHT) * predictions.to_numpy()
+                            + RELATIVE_WEIGHT * relative_predictions
+                        )
                     rows = score(model_name, fold, horizon, validation, predictions)
                     metric_rows.extend(rows)
                     log_evaluation(rows, horizon, fold, len(train), len(validation))

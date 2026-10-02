@@ -19,8 +19,10 @@ import pandas as pd
 
 try:
     from scripts.ar_baseline import ar2_station_forecast, load_profile
+    from scripts.relative_model import RelativeBlend, relative_model_path
 except ImportError:  # ejecutado como `python scripts/infer_and_submit.py`
     from ar_baseline import ar2_station_forecast, load_profile
+    from relative_model import RelativeBlend, relative_model_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_API_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
@@ -165,7 +167,9 @@ def ensure_bundle_ready() -> dict[int, tuple[Path, dict[str, Any]]]:
             archive.extractall(bundle)
 
     model_paths: dict[int, tuple[Path, dict[str, Any]]] = {}
-    for model_path in sorted((bundle / "models").glob("*.pkl")):
+    # Solo los arboles de nivel: los relativos (horizon_*_rel.pkl) se cargan junto a su
+    # horizonte segun el config.
+    for model_path in sorted((bundle / "models").glob("horizon_*_hgb.pkl")):
         is_horizon = "horizon_" in model_path.name
         if not is_horizon:
             continue
@@ -881,7 +885,12 @@ def infer_predictions_with_report(
         for horizon, (model_path, _) in bundle.items():
             try:
                 with model_path.open("rb") as stream:
-                    loaded_models[horizon] = pickle.load(stream)
+                    model = pickle.load(stream)
+                config = bundle[horizon][1]
+                if config.get("relative_weight"):
+                    with relative_model_path(model_path).open("rb") as stream:
+                        model = RelativeBlend(model, pickle.load(stream), float(config["relative_weight"]))
+                loaded_models[horizon] = model
             except Exception as exc:  # un pickle roto no puede costar el ciclo
                 report["reasons"].append(f"modelo de {horizon} min no carga: {exc}")
                 report["compatible"] = False
@@ -1030,7 +1039,7 @@ def model_metadata(bundle: dict[int, tuple[Path, dict[str, Any]]]) -> dict[str, 
     digest = hashlib.sha256()
     seen: set[Path] = set()
     for model_path, config in bundle.values():
-        for path in (model_path, model_path.parent.parent / "configs" / f"horizon_{int(model_path.name.split('horizon_')[1].split('_hgb')[0])}_ensemble.json"):
+        for path in (model_path, relative_model_path(model_path), model_path.parent.parent / "configs" / f"horizon_{int(model_path.name.split('horizon_')[1].split('_hgb')[0])}_ensemble.json"):
             if path in seen or not path.exists():
                 continue
             seen.add(path)

@@ -21,6 +21,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.ar_baseline import build_normal_profile, save_profile  # noqa: E402
+from scripts.relative_model import (  # noqa: E402
+    RELATIVE_OFFSET,
+    RELATIVE_REFERENCE,
+    RELATIVE_WEIGHT,
+    relative_model_path,
+    split_candidate_name,
+)
 from scripts.infer_and_submit import unsupported_feature_columns  # noqa: E402
 from scripts.model_gate import (  # noqa: E402
     CANDIDATE_SOURCE,
@@ -112,6 +119,9 @@ def champion_package_horizons(previous_dir: Path, champion_label: str | None) ->
         if not (model_path.exists() and config_path.exists()):
             continue
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("relative_weight") and not relative_model_path(model_path).exists():
+            print(f"  - horizonte {horizon_minutes} min fuera de la conservacion: falta su arbol relativo.")
+            continue
         columns = list(config.get("feature_columns") or [])
         unknown = unsupported_feature_columns(columns)
         if not columns or unknown:
@@ -139,6 +149,12 @@ def copy_champion_horizon(previous_dir: Path, horizon_minutes: int) -> list[Path
     missing = [str(path) for path in sources if not path.exists()]
     if missing:
         raise RuntimeError(f"El campeon no trae el horizonte {horizon_minutes}: {missing}.")
+    # Un horizonte relativo trae un segundo arbol: sin el, la inferencia no podria servirlo.
+    relative = relative_model_path(sources[0])
+    if json.loads(sources[1].read_text(encoding="utf-8")).get("relative_weight"):
+        if not relative.exists():
+            raise RuntimeError(f"El campeon declara un modelo relativo sin {relative}.")
+        sources.append(relative)
     copied: list[Path] = []
     for source in sources:
         destination = PACKAGE_DIR / source.relative_to(previous_dir)
@@ -312,7 +328,9 @@ def main() -> None:
                 model_files.extend(retained)
                 mlflow.log_param(f"h{horizon_minutes}_source", CHAMPION_SOURCE)
                 continue
-            model_name = ensemble_name.split(" + Seasonal Naive 7d", 1)[0].replace("Ensemble ", "")
+            model_name, is_relative = split_candidate_name(
+                ensemble_name.split(" + Seasonal Naive 7d", 1)[0].replace("Ensemble ", "")
+            )
             hgb_weight = float(ensemble_name.rsplit("(", 1)[1].rstrip(")"))
             horizon = horizon_minutes // 15
             horizon_frame = frame.copy()
@@ -333,7 +351,22 @@ def main() -> None:
             model_path = PACKAGE_DIR / "models" / f"horizon_{horizon_minutes}_hgb.pkl"
             with model_path.open("wb") as output:
                 pickle.dump(model, output)
+            relative_fields: dict = {}
+            if is_relative:
+                relative = module.fit_relative_model(
+                    module.MODEL_CONFIGS[model_name], horizon_frame, horizon_feature_columns
+                )
+                relative_path = relative_model_path(model_path)
+                with relative_path.open("wb") as output:
+                    pickle.dump(relative, output)
+                model_files.append(relative_path)
+                relative_fields = {
+                    "relative_weight": RELATIVE_WEIGHT,
+                    "relative_offset": RELATIVE_OFFSET,
+                    "relative_reference": RELATIVE_REFERENCE,
+                }
             config = {
+                **relative_fields,
                 "horizon_minutes": int(horizon_minutes),
                 "hgb_model": model_name,
                 "hgb_weight": hgb_weight,
