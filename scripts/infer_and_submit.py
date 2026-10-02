@@ -983,7 +983,9 @@ def infer_predictions_with_report(
                 failures[key] = failures.get(key, 0) + 1
         if value is None:
             value, source = fallback_value(station_id, data_cutoff, observations)
-        predictions.append({"station_id": station_id, "target_at": target["target_at"], "value": value})
+        # Se devuelve el station_id exactamente como lo pidio la API: normalizarlo (zfill) solo
+        # sirve para buscar historia, y un formato distinto haria que el batch no coincida.
+        predictions.append({"station_id": target["station_id"], "target_at": target["target_at"], "value": value})
         sources.append(source)
 
     finite = [item["value"] for item in predictions if item["value"] is not None]
@@ -1023,6 +1025,35 @@ def infer_predictions_with_report(
 
 def infer_predictions(cycle: dict[str, Any], bundle: dict[int, tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
     return infer_predictions_with_report(cycle, bundle)[0]
+
+
+def emergency_predictions(cycle: dict[str, Any], error: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Ultima red: si la inferencia falla por algo no previsto, persistencia o constante.
+
+    No usa nada del campeon ni del chequeo de compatibilidad, que son justo lo que pudo
+    fallar: solo la ultima demanda local de cada estacion y, si no existe, la mediana.
+    """
+
+    try:
+        observations, _ = load_inference_frames()
+        cutoff = pd.to_datetime(cycle["data_cutoff"], utc=True)
+        observations = observations.loc[observations["observed_at"] <= cutoff].sort_values("observed_at")
+        last = observations.groupby("station_id")["demand"].last().dropna().to_dict()
+    except Exception:
+        last = {}
+    fallback = float(pd.Series(list(last.values())).median()) if last else FALLBACK_CONSTANT
+    predictions = []
+    for target in cycle["targets"]:
+        value = last.get(normalize_station_id(target["station_id"]), fallback)
+        value = value if math.isfinite(value) and value >= 0 else fallback
+        predictions.append({"station_id": target["station_id"], "target_at": target["target_at"], "value": round(float(value), 4)})
+    report = {
+        "cycle_id": cycle.get("cycle_id"), "data_cutoff": cycle.get("data_cutoff"), "compatible": False,
+        "reasons": [f"la inferencia fallo y se envio la red de emergencia: {error}"],
+        "total_targets": len(predictions), "champion_targets": 0, "fallback_targets": len(predictions),
+        "sources": {"emergencia": len(predictions)}, "champion_failures": {},
+    }
+    return predictions, report
 
 
 def persist_compatibility(report: dict[str, Any], model_version: str | None) -> None:
@@ -1129,16 +1160,18 @@ def validate_predictions(cycle: dict[str, Any], predictions: list[dict[str, Any]
         for item in predictions
     ]
     expected_count = cycle.get("expected_predictions", len(expected))
-    if len(predictions) != expected_count or len(set(received_keys)) != len(received_keys):
-        raise ValueError(
-            f"Cantidad de predicciones inválida: se esperaban {expected_count} "
-            f"y se generaron {len(predictions)}."
-        )
+    if len(set(received_keys)) != len(received_keys):
+        raise ValueError(f"Hay predicciones duplicadas: {len(received_keys)} filas, {len(set(received_keys))} unicas.")
+    if expected_count != len(expected):
+        # El ciclo declara un conteo que no cuadra con sus targets: se responde exactamente lo
+        # que pide la lista y que la API decida; abortar aqui perderia el ciclo seguro.
+        print(f"::warning::El ciclo declara {expected_count} predicciones pero trae {len(expected)} targets; se envian {len(predictions)}.")
     if set(received_keys) != expected_keys:
         raise ValueError("Las estaciones y fechas de las predicciones no coinciden con los objetivos del ciclo.")
     for item in predictions:
         value = item.get("value")
-        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0 or value > 100000:
+        # Sin tope superior: si cambia la escala de la demanda, un tope fijo tumbaria el ciclo.
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"Predicción inválida para {item.get('station_id')}: {value}")
 
 
@@ -1256,7 +1289,13 @@ def main() -> int:
             return 0
 
         if not args.dry_run:
-            receipt = find_confirmed_submission(str(cycle["cycle_id"]))
+            try:
+                receipt = find_confirmed_submission(str(cycle["cycle_id"]))
+            except Exception as exc:
+                # Sin Supabase no se puede ver el recibo, pero la Idempotency-Key estable evita
+                # duplicar el mismo contenido: perder el ciclo es peor que un intento extra.
+                print(f"::warning::No se pudo consultar el recibo ({exc}); se envia igual con la misma Idempotency-Key.")
+                receipt = None
             if receipt:
                 print(f"El ciclo ya tiene recibo oficial {receipt.get('submission_id')}; se omite el POST duplicado.")
                 write_github_output("submitted", "true")
@@ -1283,8 +1322,13 @@ def main() -> int:
             bundle = ensure_bundle_ready()
         except Exception as exc:
             bundle, bundle_error = {}, f"{type(exc).__name__}: {exc}"
-        predictions, report = infer_predictions_with_report(cycle, bundle, bundle_error)
-        validate_predictions(cycle, predictions)
+        try:
+            predictions, report = infer_predictions_with_report(cycle, bundle, bundle_error)
+            validate_predictions(cycle, predictions)
+        except Exception as exc:
+            print(f"::error::La inferencia fallo ({type(exc).__name__}: {exc}); se envia la red de emergencia.")
+            predictions, report = emergency_predictions(cycle, f"{type(exc).__name__}: {exc}")
+            validate_predictions(cycle, predictions)
         metadata = model_metadata(bundle)
         if bundle and report["fallback_targets"]:
             metadata["version"] = f"{metadata['version']}+respaldo"
