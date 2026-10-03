@@ -21,9 +21,11 @@ try:
     from scripts.ar_baseline import ar2_station_forecast, load_profile
     from scripts.leader_model import leader_forecasts
     from scripts.relative_model import RelativeBlend, relative_model_path
+    from scripts.stream_schema import row_demand
 except ImportError:  # ejecutado como `python scripts/infer_and_submit.py`
     from ar_baseline import ar2_station_forecast, load_profile
     from leader_model import leader_forecasts
+    from stream_schema import row_demand
     from relative_model import RelativeBlend, relative_model_path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -519,7 +521,16 @@ def _refresh_observations_from_stream(client: httpx.Client, data_cutoff: pd.Time
         return
     if not rows:
         return
-    stream = pd.DataFrame(rows)[["station_id", "observed_at", "demand"]]
+    # El esquema 2 trae la demanda en `measurement` y `demand` vacio: se lee con el mismo
+    # parser que el colector, y las filas sin medicion valida no pisan datos buenos.
+    stream = pd.DataFrame(
+        [
+            {"station_id": row.get("station_id"), "observed_at": row.get("observed_at"), "demand": row_demand(row)}
+            for row in rows
+        ]
+    ).dropna(subset=["station_id", "observed_at", "demand"])
+    if stream.empty:
+        return
     stream["observed_at"] = pd.to_datetime(stream["observed_at"], utc=True)
     stream = stream[stream["observed_at"] <= data_cutoff]
     path = SAMPLE_DATA_PATHS["observations"]

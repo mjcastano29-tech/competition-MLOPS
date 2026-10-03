@@ -10,6 +10,11 @@ import httpx
 
 from pulso_transmi import PulsoTransmiClient
 
+try:
+    from scripts.stream_schema import row_demand
+except ImportError:  # ejecutado como `python scripts/ingest_api_to_supabase.py`
+    from stream_schema import row_demand
+
 
 BATCH_SIZE = 500
 STREAM_PAGE_SIZE = 5000
@@ -242,11 +247,15 @@ def main() -> None:
                     if watermark is not None and released_at < watermark:
                         continue
                     observed_at = canonical_timestamp(row["observed_at"])
+                    demand = row_demand(row)
+                    if demand is None:
+                        # Esquema 2 sin medicion valida: no se escribe un cero inventado.
+                        continue
                     stream_rows.append({
                         "dataset_id": dataset_id,
                         "station_id": str(row["station_id"]),
                         "observed_at": observed_at,
-                        "demand": int(row["demand"]),
+                        "demand": int(round(demand)),
                     })
                     if observed_at not in known_context_times:
                         # The API stream can publish demand before its context
