@@ -1331,7 +1331,7 @@ def main() -> int:
             validate_predictions(cycle, predictions)
         metadata = model_metadata(bundle)
         if bundle and report["fallback_targets"]:
-            metadata["version"] = f"{metadata['version']}+respaldo"
+            metadata["version"] = f"{metadata['version']}-respaldo"
         COMPATIBILITY_REPORT.parent.mkdir(parents=True, exist_ok=True)
         COMPATIBILITY_REPORT.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         write_github_output("compatible", str(report["compatible"]).lower())
