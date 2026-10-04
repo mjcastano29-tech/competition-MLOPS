@@ -23,6 +23,11 @@ import pandas as pd
 
 from pulso_transmi import PulsoTransmiClient
 
+try:
+    from scripts.stream_schema import row_demand
+except ImportError:  # ejecutado como `python scripts/download_api_data.py`
+    from stream_schema import row_demand
+
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 STARTER_FILES = ("stations.csv", "observations.csv", "context.csv", "metadata.json")
@@ -44,6 +49,8 @@ def fetch_stream_observations(client: PulsoTransmiClient) -> pd.DataFrame:
         if cursor in seen:
             raise RuntimeError("La API devolvió un cursor repetido en el stream.")
         seen.add(cursor)
+    # Esquema 2 del stream: la demanda viene en `measurement`; mismo parser que el pipeline.
+    rows = [{**row, "demand": row_demand(row)} for row in rows]
     frame = pd.DataFrame(rows)
     if frame.empty:
         return pd.DataFrame(columns=["station_id", "observed_at", "demand", "released_at"])
