@@ -6,6 +6,7 @@ import json
 import math
 import os
 import pickle
+import re
 import subprocess
 import sys
 import time
@@ -30,7 +31,7 @@ except ImportError:  # ejecutado como `python scripts/infer_and_submit.py`
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_API_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
-BUNDLE_DIR = ROOT / "artifacts" / "pulso_transmi_best_models"
+BUNDLE_DIR = Path(os.getenv("PULSO_BUNDLE_DIR") or ROOT / "artifacts" / "pulso_transmi_best_models")
 BUNDLE_ZIP = ROOT / "artifacts" / "pulso_transmi_best_models.zip"
 # Legacy Actions cache entries use the gap133 cache namespace but predate
 # history_gap_steps in each per-horizon JSON config.
@@ -1099,6 +1100,24 @@ def persist_compatibility(report: dict[str, Any], model_version: str | None) -> 
         print(f"Aviso: no se guardo el chequeo de compatibilidad ({exc}).")
 
 
+MAX_BUNDLE_AGE_DAYS = 7
+
+
+def bundle_staleness_days(bundle: dict[int, tuple[Path, dict[str, Any]]], cutoff: pd.Timestamp) -> float | None:
+    """Dias entre el ultimo dato de entrenamiento del paquete y el corte; None si no se sabe."""
+
+    if not bundle:
+        return None
+    manifest_path = next(iter(bundle.values()))[0].parent.parent / "manifest.json"
+    try:
+        end = json.loads(manifest_path.read_text(encoding="utf-8")).get("training_data_end")
+    except (OSError, ValueError):
+        return None
+    if not end:
+        return None
+    return (pd.Timestamp(cutoff).tz_convert("UTC") - pd.to_datetime(end, utc=True)).total_seconds() / 86400
+
+
 def model_metadata(bundle: dict[int, tuple[Path, dict[str, Any]]]) -> dict[str, str | None]:
     if not bundle:
         return {"version": FALLBACK_MODEL_VERSION, "training_data_end": None}
@@ -1143,6 +1162,28 @@ def find_confirmed_submission(cycle_id: str) -> dict[str, Any] | None:
     rows = response.json()
     return rows[0] if rows else None
 
+def _git_commit() -> str:
+    """Commit de 7-40 hex que exige la API: GITHUB_SHA en Actions, git local si no."""
+
+    for candidate in (os.getenv("GITHUB_SHA"),):
+        if candidate and re.fullmatch(r"[0-9a-fA-F]{7,40}", candidate):
+            return candidate
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=ROOT, check=True).stdout.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{7,40}", head):
+            return head
+    except Exception:
+        pass
+    return "0000000"
+
+
+def _safe_version(value: Any) -> str:
+    """La API rechaza caracteres fuera de [A-Za-z0-9._-] en model.version (p. ej. '+')."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "-", str(value or FALLBACK_MODEL_VERSION)).strip("-") or FALLBACK_MODEL_VERSION
+    return cleaned[:120]
+
+
 def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]], metadata: dict[str, str | None] | None = None) -> dict[str, Any]:
     cycle_fingerprint = hashlib.sha256(str(cycle["cycle_id"]).encode("utf-8")).hexdigest()[:32]
     payload = {
@@ -1151,9 +1192,9 @@ def build_payload(cycle: dict[str, Any], predictions: list[dict[str, Any]], meta
         "client_run_id": f"gha-cycle-{cycle_fingerprint}",
         "data_cutoff": cycle["data_cutoff"],
         "model": {
-            "version": (metadata or {}).get("version", "pulso-transmi-history-gap-aware-hgb"),
+            "version": _safe_version((metadata or {}).get("version", "pulso-transmi-history-gap-aware-hgb")),
             "training_data_end": (metadata or {}).get("training_data_end"),
-            "git_commit": os.getenv("GITHUB_SHA", "unknown"),
+            "git_commit": _git_commit(),
         },
         "predictions": predictions,
     }
@@ -1279,6 +1320,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "current_submission.json")
     parser.add_argument("--wait-seconds", type=int, default=0, help="Espera este tiempo buscando un ciclo abierto.")
     parser.add_argument("--poll-seconds", type=int, default=30, help="Intervalo entre consultas del ciclo.")
+    parser.add_argument("--replace-attempt", type=int, default=0,
+                        help="Reemplaza la entrega del ciclo con un intento nuevo (2 o 3): usa otra Idempotency-Key.")
     args = parser.parse_args()
 
     api_key = os.getenv("PULSO_API_KEY")
@@ -1331,6 +1374,11 @@ def main() -> int:
         bundle_error = None
         try:
             bundle = ensure_bundle_ready()
+            stale = bundle_staleness_days(bundle, cutoff)
+            if stale is not None and stale > MAX_BUNDLE_AGE_DAYS:
+                # Un paquete viejo (p. ej. uno local olvidado en artifacts/) predice peor que
+                # el respaldo: se trata como incompatible en vez de usarlo en silencio.
+                bundle, bundle_error = {}, f"paquete entrenado con datos de hace {stale:.1f} dias (max {MAX_BUNDLE_AGE_DAYS})"
         except Exception as exc:
             bundle, bundle_error = {}, f"{type(exc).__name__}: {exc}"
         try:
@@ -1351,6 +1399,8 @@ def main() -> int:
         if not args.dry_run:
             persist_compatibility(report, metadata["version"])
         payload = build_payload(cycle, predictions, metadata)
+        if args.replace_attempt:
+            payload["client_run_id"] = f"{payload['client_run_id']}-r{args.replace_attempt}"
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Payload generado en {args.output} con {len(predictions)} predicciones.")
@@ -1360,6 +1410,14 @@ def main() -> int:
             return 0
 
         response = submit_with_retries(client, api_key, payload)
+        if response.status_code == 409 and "idempotency_conflict" in response.text:
+            # Otro run (o un envio manual) ya entrego este ciclo con esta misma clave: el
+            # ciclo esta cubierto. No es un fallo, y reintentar no cambiaria nada.
+            print("El ciclo ya fue entregado con esta Idempotency-Key por otro run; no se reenvia.")
+            write_github_output("submitted", "true")
+            write_github_output("already_submitted", "true")
+            write_github_output("monitoring_persisted", "true")
+            return 0
         if response.is_error:
             raise RuntimeError(f"Submission rechazada: HTTP {response.status_code} {response.text}")
         result = response.json()

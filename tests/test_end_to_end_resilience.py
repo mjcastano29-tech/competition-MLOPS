@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import re
 import subprocess
 import sys
 
@@ -48,7 +49,7 @@ def cycle(stations, horizons=(15, 30, 45, 60), expected=None):
 def world(tmp_path, monkeypatch):
     sent = {}
 
-    def install(cyc, rows, bundle=True, supabase_receipt_fails=False):
+    def install(cyc, rows, bundle=True, supabase_receipt_fails=False, conflict=False, manifest=None):
         root = tmp_path / "bundle"
         if bundle:
             (root / "models").mkdir(parents=True)
@@ -57,6 +58,8 @@ def world(tmp_path, monkeypatch):
             for m in (15, 30, 45, 60):
                 (root / "models" / f"horizon_{m}_hgb.pkl").write_bytes(pickle.dumps(Fixed()))
                 (root / "configs" / f"horizon_{m}_ensemble.json").write_text(json.dumps({**config, "horizon_minutes": m}))
+            if manifest is not None:
+                (root / "manifest.json").write_text(json.dumps(manifest))
         monkeypatch.setattr(inf, "BUNDLE_DIR", root)
         monkeypatch.setattr(inf, "BUNDLE_ZIP", tmp_path / "no.zip")
         monkeypatch.setattr(inf, "COMPATIBILITY_REPORT", tmp_path / "compat.json")
@@ -84,7 +87,15 @@ def world(tmp_path, monkeypatch):
             if request.url.path == "/v1/stream/observations":
                 return httpx.Response(200, json={"data": rows, "next_cursor": None})
             if request.url.path == "/v1/submissions" and request.method == "POST":
-                sent["payload"] = json.loads(request.content)
+                body = json.loads(request.content)
+                # Mismas reglas que la API real aplico con 422 el 2026-10-03.
+                if not re.fullmatch(r"[A-Za-z0-9._-]+", body["model"]["version"]):
+                    return httpx.Response(422, json={"detail": "version contains unsupported characters"})
+                if not re.fullmatch(r"[0-9a-fA-F]{7,40}", body["model"]["git_commit"]):
+                    return httpx.Response(422, json={"detail": "git_commit must contain 7 to 40 hexadecimal characters"})
+                if conflict:
+                    return httpx.Response(409, json={"detail": {"code": "idempotency_conflict", "message": "Idempotency-Key was already used with different content"}})
+                sent["payload"] = body
                 return httpx.Response(201, json={"submission_id": "sub_1", "status": "accepted", "is_official": True})
             return httpx.Response(404, json={})
 
@@ -130,3 +141,25 @@ def test_un_fallo_inesperado_en_la_inferencia_usa_la_red_de_emergencia(world, mo
     assert inf.main() == 0
     assert_valid_batch(sent, cyc)
     assert sent["payload"]["predictions"][0]["value"] > 1  # persistencia real, no la constante
+
+
+def test_un_409_de_idempotencia_cuenta_como_entregado(world):
+    sent = world(cycle(BASE), stream_rows(BASE), conflict=True)
+    assert inf.main() == 0 and "payload" not in sent
+
+
+def test_un_paquete_viejo_no_se_usa(world, monkeypatch, tmp_path):
+    cyc = cycle(BASE)
+    sent = world(cyc, stream_rows(BASE), manifest={"training_data_end": "2026-09-08T04:45:00+00:00"})
+    assert inf.main() == 0
+    assert_valid_batch(sent, cyc)
+    report = json.loads((tmp_path / "compat.json").read_text())
+    assert report["sources"].get("campeon", 0) == 0 and any("dias" in r for r in report["reasons"])
+
+
+def test_el_respaldo_pasa_el_contrato_de_la_api(world):
+    # El 2026-10-03 la version '...+respaldo' fue rechazada con 422: debe pasar ahora.
+    cyc = cycle(BASE + ["99999"])
+    sent = world(cyc, stream_rows(BASE))
+    assert inf.main() == 0
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", sent["payload"]["model"]["version"])
