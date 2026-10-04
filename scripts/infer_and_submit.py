@@ -928,7 +928,9 @@ def infer_predictions_with_report(
     # que el entrenamiento eligio en validacion. Sin perfil en el paquete o sin datos
     # suficientes no se mezcla: la prediccion del campeon queda tal cual.
     ar_forecasts: dict[str, np.ndarray] = {}
-    if loaded_models:
+    # AR_MIX=off apaga la mezcla: en el regimen que empezo el 2026-09-20 12:15 (virtual) las
+    # estaciones dejaron de oscilar con regularidad y el AR resto 0-9 pts por ciclo.
+    if loaded_models and os.getenv("AR_MIX", "on").lower() not in {"off", "0", "false"}:
         try:
             profile = load_profile(next(iter(bundle.values()))[0].parent.parent)
             if profile is not None:

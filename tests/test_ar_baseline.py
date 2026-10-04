@@ -112,3 +112,26 @@ def test_la_inferencia_mezcla_igual_que_el_entrenamiento(tmp_path, monkeypatch):
     expected = apply_ar_weights(np.full(4, 100.0), ar, np.array(["A"] * 4), {"A": 0.4})
     np.testing.assert_allclose([p["value"] for p in predictions], np.round(expected, 4))
     assert report["ar_mixed_stations"] == ["A"] and report["sources"] == {"campeon": 4}
+
+
+def test_ar_mix_off_deja_la_prediccion_del_campeon(tmp_path, monkeypatch):
+    monkeypatch.setenv("AR_MIX", "off")
+    history = flat_history(level=100.0)
+    history.loc[history.index[-4:], "demand"] = 200.0
+    history.to_csv(tmp_path / "obs.csv", index=False)
+    pd.DataFrame(columns=["observed_at", *inf.CONTEXT_COLUMNS]).to_csv(tmp_path / "ctx.csv", index=False)
+    monkeypatch.setitem(inf.SAMPLE_DATA_PATHS, "observations", tmp_path / "obs.csv")
+    monkeypatch.setitem(inf.SAMPLE_DATA_PATHS, "context", tmp_path / "ctx.csv")
+    monkeypatch.setenv("BIAS_CORRECTION", "off"); monkeypatch.setenv("LEADER_MODEL", "off")
+    root = tmp_path / "bundle"; (root / "models").mkdir(parents=True)
+    save_profile(build_normal_profile(flat_history(level=100.0)), root)
+    config = {"history_gap_steps": 0, "hgb_weight": 1.0, "feature_columns": ["is_weekend"], "ar_weights": {"A": 0.4}}
+    bundle = {}
+    for minutes in (15, 30, 45, 60):
+        path = root / "models" / f"horizon_{minutes}_hgb.pkl"; path.write_bytes(pickle.dumps(FixedModel()))
+        bundle[minutes] = (path, {**config, "horizon_minutes": minutes})
+    cutoff = history["observed_at"].max()
+    cycle = {"cycle_id": "c", "data_cutoff": cutoff.isoformat(), "expected_predictions": 4,
+             "targets": [{"station_id": "A", "target_at": (cutoff + pd.Timedelta(minutes=15 * h)).isoformat()} for h in (1, 2, 3, 4)]}
+    predictions, report = inf.infer_predictions_with_report(cycle, bundle)
+    assert [p["value"] for p in predictions] == [100.0] * 4 and report["ar_mixed_stations"] == []
