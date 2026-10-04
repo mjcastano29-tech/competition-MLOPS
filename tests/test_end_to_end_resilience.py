@@ -49,7 +49,7 @@ def cycle(stations, horizons=(15, 30, 45, 60), expected=None):
 def world(tmp_path, monkeypatch):
     sent = {}
 
-    def install(cyc, rows, bundle=True, supabase_receipt_fails=False, conflict=False, manifest=None):
+    def install(cyc, rows, bundle=True, supabase_receipt_fails=False, conflict=False, manifest=None, extra_rule=None):
         root = tmp_path / "bundle"
         if bundle:
             (root / "models").mkdir(parents=True)
@@ -93,6 +93,8 @@ def world(tmp_path, monkeypatch):
                     return httpx.Response(422, json={"detail": "version contains unsupported characters"})
                 if not re.fullmatch(r"[0-9a-fA-F]{7,40}", body["model"]["git_commit"]):
                     return httpx.Response(422, json={"detail": "git_commit must contain 7 to 40 hexadecimal characters"})
+                if extra_rule is not None and (detail := extra_rule(body)):
+                    return httpx.Response(422, json={"detail": detail})
                 if conflict:
                     return httpx.Response(409, json={"detail": {"code": "idempotency_conflict", "message": "Idempotency-Key was already used with different content"}})
                 sent["payload"] = body
@@ -163,3 +165,16 @@ def test_el_respaldo_pasa_el_contrato_de_la_api(world):
     sent = world(cyc, stream_rows(BASE))
     assert inf.main() == 0
     assert re.fullmatch(r"[A-Za-z0-9._-]+", sent["payload"]["model"]["version"])
+
+
+def test_una_regla_nueva_de_la_api_no_tumba_el_ciclo(world):
+    # Una validacion que no conocemos (aqui: max. 2 decimales y version fija) rechaza el
+    # primer batch: el reintento con formato minimo y otra clave debe entrar.
+    def rule(body):
+        if any(round(p["value"], 2) != p["value"] for p in body["predictions"]) or body["model"]["version"] != "respaldo-persistencia":
+            return "regla nueva"
+    cyc = cycle(BASE)
+    sent = world(cyc, stream_rows(BASE), extra_rule=rule)
+    assert inf.main() == 0
+    assert_valid_batch(sent, cyc)
+    assert sent["payload"]["client_run_id"].endswith("-safe")

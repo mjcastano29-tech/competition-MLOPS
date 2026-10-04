@@ -1258,6 +1258,33 @@ def submit_with_retries(
     raise RuntimeError("Se agotaron los intentos de envío.")
 
 
+def safe_payload(payload: dict[str, Any], cycle: dict[str, Any]) -> dict[str, Any]:
+    """Version minima del batch para reintentar cuando la API lo rechaza por una regla nueva.
+
+    El 2026-10-03 un 422 por un caracter en model.version tumbo el ciclo: aqui se descarta
+    todo lo opcional, se copian los targets tal cual los entrego el ciclo y se redondean los
+    valores. Va con otra Idempotency-Key para que el rechazo previo no lo convierta en 409.
+    """
+
+    values = {
+        (normalize_station_id(p["station_id"]), pd.to_datetime(p["target_at"], utc=True)): p["value"]
+        for p in payload["predictions"]
+    }
+    finite = [v for v in values.values() if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0]
+    default = float(pd.Series(finite).median()) if finite else FALLBACK_CONSTANT
+    predictions = []
+    for target in cycle["targets"]:
+        value = values.get((normalize_station_id(target["station_id"]), pd.to_datetime(target["target_at"], utc=True)), default)
+        value = value if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 else default
+        predictions.append({"station_id": target["station_id"], "target_at": target["target_at"], "value": round(float(value), 2)})
+    return {
+        **payload,
+        "client_run_id": f"{payload['client_run_id']}-safe",
+        "model": {"version": FALLBACK_MODEL_VERSION, "training_data_end": cycle["data_cutoff"], "git_commit": _git_commit()},
+        "predictions": predictions,
+    }
+
+
 def write_github_output(name: str, value: str) -> None:
     output_path = os.getenv("GITHUB_OUTPUT")
     if output_path:
@@ -1420,6 +1447,13 @@ def main() -> int:
             write_github_output("already_submitted", "true")
             write_github_output("monitoring_persisted", "true")
             return 0
+        if response.status_code in {400, 422}:
+            # Una regla de validacion nueva de la API no debe costar el ciclo: se reintenta
+            # con el formato minimo antes de rendirse.
+            print(f"::error::La API rechazo el batch (HTTP {response.status_code} {response.text}); se reintenta con el formato minimo.")
+            payload = safe_payload(payload, cycle)
+            args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            response = submit_with_retries(client, api_key, payload)
         if response.is_error:
             raise RuntimeError(f"Submission rechazada: HTTP {response.status_code} {response.text}")
         result = response.json()

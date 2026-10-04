@@ -17,7 +17,7 @@ jobs:
     concurrency:
       group: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'forecast-cycle-dry-run' || 'forecast-cycle-poller' }}
       cancel-in-progress: false
-    timeout-minutes: 8
+    timeout-minutes: 14
     permissions:
       contents: read
       # Permite recuperar el paquete del campeon publicado por el ultimo reentrenamiento
@@ -102,6 +102,7 @@ jobs:
       - name: Submit immediately with cached model
         id: fast_submit
         if: env.DRY_RUN != 'true' && steps.model_state.outputs.available == 'true'
+        timeout-minutes: 6
         run: |
           PYTHONPATH=src python scripts/infer_and_submit.py \
             --output artifacts/current_submission.json \
@@ -111,6 +112,7 @@ jobs:
       - name: Check whether the cycle is open, generate predictions, and submit
         id: final_submit
         if: steps.fast_submit.outcome == 'skipped' || env.DRY_RUN == 'true'
+        timeout-minutes: 6
         run: |
           args=(--output artifacts/current_submission.json)
           if [[ "$DRY_RUN" == "true" ]]; then
@@ -118,6 +120,34 @@ jobs:
           fi
           args+=(--wait-seconds 0 --poll-seconds 30)
           PYTHONPATH=src python scripts/infer_and_submit.py "${args[@]}"
+
+      - name: Last-resort submission when no delivery was confirmed
+        id: last_resort
+        # Corre si cualquier paso anterior fallo (instalacion, paquete, inferencia o un rechazo
+        # de la API) y nadie confirmo la entrega. Solo libreria estandar: no depende de lo roto.
+        if: >-
+          failure() && env.DRY_RUN != 'true' &&
+          steps.fast_submit.outputs.submitted != 'true' &&
+          steps.final_submit.outputs.submitted != 'true'
+        timeout-minutes: 4
+        run: python3 scripts/last_resort_submit.py
+
+      - name: Alert that the last-resort submission was used
+        if: always() && steps.last_resort.outcome != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.last_resort.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=modelo-incompatible
+          gh label create "$label" --repo "$GITHUB_REPOSITORY" --color d73a4a 2>/dev/null || true
+          if [[ "$OUTCOME" == "success" ]]; then
+            title="El envio normal fallo: el ciclo salio por el ultimo recurso (persistencia)"
+          else
+            title="URGENTE: el ciclo no se pudo enviar (ni el ultimo recurso)"
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" --label "$label" --title "$title" \
+            --body "El paso principal de envio fallo en $RUN_URL. Resultado del ultimo recurso: **$OUTCOME**. Revisar el log del paso de envio. Envio manual: \`bash scripts/emergency_submit.sh\`."
 
       - name: Report delivery outcome
         if: always()
@@ -138,7 +168,9 @@ jobs:
           print(f"Ciclo: `{payload['cycle_id']}` · Predicciones: {len(payload['predictions'])}")
           PY
           fi
-          if [[ "$DRY_RUN" == "true" ]]; then
+          if [[ "${{ steps.last_resort.outcome }}" == "success" ]]; then
+            echo "Entrega confirmada por el ultimo recurso (persistencia): el envio principal fallo." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$DRY_RUN" == "true" ]]; then
             echo "Dry run: payload generado sin envío." >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$FAST_SUBMITTED" == "true" || "$FINAL_SUBMITTED" == "true" ]]; then
             submission_id="${FAST_SUBMISSION_ID:-$FINAL_SUBMISSION_ID}"
